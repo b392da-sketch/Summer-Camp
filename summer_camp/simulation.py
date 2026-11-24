@@ -1,16 +1,41 @@
 """Coordinate the clock, private decisions, world transitions, and history."""
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from functools import partial
 from random import Random
+from types import MappingProxyType
 
 from .clock import DAY, Clock
-from .cognition import REASSESS, Mind, Staff
-from .world import PATHS, Request, World
+from .cognition import CAMP_DESTINATIONS, REASSESS, Mind, Staff, route
+from .world import PATHS, Action, Job, Observation, Request, World
 
 MAX_DAYS = 7
 DEFAULT_REPAIRS = ("canoe rack", "supply cart", "trail sign")
 DEFAULT_STAFF = (Staff("Ada"), Staff("Ben"), Staff("Clara"))
+
+
+@dataclass(frozen=True)
+class CampLayout:
+    paths: Mapping[str, tuple[str, ...]]
+    jobs: tuple[Job, ...]
+    ingredients: int
+
+    def __post_init__(self):
+        paths = {location: tuple(neighbors) for location, neighbors in self.paths.items()}
+        if type(self.ingredients) is not int or self.ingredients < 0:
+            raise ValueError("Ingredients must be a nonnegative integer")
+        if any(location not in paths for location in CAMP_DESTINATIONS.values()):
+            raise ValueError("Camp needs cabins, a kitchen and commons")
+        for location, neighbors in paths.items():
+            if any(location not in paths.get(neighbor, ()) for neighbor in neighbors):
+                raise ValueError("Camp paths must connect known facilities in both directions")
+            route("commons", location, paths)
+        if len({job.target for job in self.jobs}) != len(self.jobs):
+            raise ValueError("Job identities must be unique")
+        if any(job.location not in paths for job in self.jobs):
+            raise ValueError("Jobs must use known facilities")
+        object.__setattr__(self, "paths", MappingProxyType(paths))
 
 
 @dataclass(frozen=True)
@@ -19,6 +44,7 @@ class Scenario:
     days: int = MAX_DAYS
     servings: int = 200
     repair_targets: tuple[str, ...] = DEFAULT_REPAIRS
+    camp: CampLayout | None = None
 
     def __post_init__(self):
         if type(self.days) is not int or not 1 <= self.days <= MAX_DAYS:
@@ -32,7 +58,15 @@ class Scenario:
         names = [staff.name for staff in self.staff]
         if not names or any(not name for name in names) or len(names) != len(set(names)):
             raise ValueError("Staff names must be nonempty and unique")
-        if any(staff.location not in PATHS for staff in self.staff):
+        paths = self.camp.paths if self.camp is not None else PATHS
+        if any((staff.profile is not None) != (self.camp is not None) for staff in self.staff):
+            raise ValueError("Camp scenarios require a profile for every staff member")
+        for staff in self.staff:
+            if staff.profile is not None and any(
+                location not in paths for location in staff.profile.responsibilities
+            ):
+                raise ValueError("Responsibilities must use known facilities")
+        if any(staff.location not in paths for staff in self.staff):
             raise ValueError("Staff must start at a camp location")
 
 
@@ -51,10 +85,18 @@ class Simulation:
         self._clock = Clock()
         rng = Random(seed)
         self._minds = {staff.name: Mind.create(staff, rng) for staff in scenario.staff}
+        camp = scenario.camp
         self._world = World(
             {staff.name: staff.location for staff in scenario.staff},
             scenario.servings,
-            scenario.repair_targets,
+            scenario.repair_targets if camp is None else (),
+            paths=camp.paths if camp is not None else PATHS,
+            jobs=camp.jobs if camp is not None else (),
+            ingredients=camp.ingredients if camp is not None else 0,
+            capabilities={staff.name: staff.profile.capabilities for staff in scenario.staff
+                          if staff.profile is not None},
+            sleep_durations={staff.name: staff.profile.sleep_duration for staff in scenario.staff
+                             if staff.profile is not None} if camp is not None else None,
         )
         self._history: list[Event] = []
         self._wakes: dict[str, tuple[int, int]] = {}
@@ -86,7 +128,7 @@ class Simulation:
 
     def snapshot(self) -> dict:
         """Return a detached view of authoritative state for diagnostics."""
-        return {
+        state = {
             "now": self.now,
             "horizon": self.horizon,
             "locations": dict(self._world.locations),
@@ -96,6 +138,24 @@ class Simulation:
             "minds": {staff: asdict(mind) for staff, mind in self._minds.items()},
             "scheduled": sorted((when, sequence, staff) for staff, (when, sequence) in self._wakes.items()),
         }
+
+        if self._world.sleep_durations:
+            state.update(
+                job_states=dict(self._world.job_states),
+                ingredients=self._world.ingredients,
+                reserved_ingredients=self._world.ingredients - self._world.unreserved_ingredients,
+            )
+        return state
+
+    def cancel_preparation(self, staff: str) -> bool:
+        """Cancel an active M1 job, releasing reservations and discarding its progress."""
+        action = self._world.active.get(staff)
+        if action is None or action.request.kind != "prepare" or self.now == self.horizon:
+            return False
+        commitment = self._world.interrupt_work(staff, self.now)
+        self._record(staff, "cancelled", "prepare", f"target={commitment.target}")
+        self._schedule(staff, self.now)
+        return True
 
     def _record(self, staff: str, phase: str, action: str, detail: str = "") -> None:
         self._history.append(Event(self.now, staff, phase, action, detail))
@@ -109,6 +169,8 @@ class Simulation:
     def _start(self, staff: str, request: Request, goal: str | None = None) -> bool:
         mind = self._minds[staff]
         commitment = mind.repair_commitment
+        if request.kind == "prepare" and request.target is not None:
+            commitment = mind.preparations.get(request.target)
         try:
             action = self._world.start(staff, request, self.now, commitment)
         except ValueError as error:
@@ -118,20 +180,29 @@ class Simulation:
         kind = request.kind
         phase = "started"
         detail = ""
-        if kind == "work":
+        if kind in ("work", "prepare"):
             detail = f"target={request.target}"
             if commitment is not None and request.target == commitment.target:
                 phase = "resumed"
         elif kind == "move":
             detail = f"to={request.destination} goal={goal or 'external'}"
+        if mind.profile is not None:
+            mind.accrue(self.now)
+        if kind == "sleep":
+            detail = f"duration={action.ends_at - self.now}s"
         self._record(staff, phase, kind, detail)
         mind.travel_goal = goal if kind == "move" else None
         if phase == "resumed":
-            mind.repair_commitment = None
+            if kind == "prepare":
+                del mind.preparations[commitment.target]
+            else:
+                mind.repair_commitment = None
         self._schedule(staff, self._next_check(kind, action.ends_at))
         return True
 
     def _next_check(self, kind: str, ends_at: int) -> int:
+        if kind in ("prepare", "sleep"):
+            return min(ends_at, self.now + REASSESS, self.horizon)
         return min(ends_at, self.now + REASSESS) if kind == "work" else ends_at
 
     def _wake(self, staff: str, ticket: tuple[int, int]) -> None:
@@ -139,8 +210,9 @@ class Simulation:
             return
         del self._wakes[staff]
         mind = self._minds[staff]
-        mind.accrue(self.now)
         action = self._world.active.get(staff)
+        sleeping = action is not None and action.request.kind == "sleep"
+        mind.accrue(self.now, sleeping=sleeping)
         if action and action.ends_at == self.now:
             kind = action.request.kind
             detail = self._world.finish(staff)
@@ -152,6 +224,10 @@ class Simulation:
         observations = self._world.observe(staff, self.now)
         mind.memory.update(observations)
         commitment = mind.repair_commitment
+        location = self._world.locations[staff]
+        if mind.profile is not None:
+            self._camp_wake(staff, mind, action, observations, location)
+            return
         if commitment is not None and "work" in observations:
             if commitment.target not in observations["work"].damaged_targets:
                 mind.repair_commitment = None
@@ -181,10 +257,42 @@ class Simulation:
                 self._record(staff, "redirected", intended, reason)
                 mind.travel_goal = None
 
-        decision = mind.choose(self._world.locations[staff], self.now)
+        decision = mind.choose(location, self.now)
         if decision is not None:
             goal, request = decision
             if self._start(staff, request, goal):
                 return
         mind.travel_goal = None
         self._schedule(staff, self.now + REASSESS)
+
+    def _camp_wake(
+        self, staff: str, mind: Mind, action: Action | None,
+        observations: dict[str, Observation], location: str,
+    ) -> None:
+        local_jobs = observations.get(f"prepare:{location}")
+        for job in local_jobs.jobs if local_jobs is not None else ():
+            if job.done and job.target in mind.preparations:
+                del mind.preparations[job.target]
+                self._record(staff, "abandoned", "prepare", f"target={job.target} completed by peer")
+        if self.now == self.horizon:
+            return
+        if action is not None:
+            kind = action.request.kind
+            reason = mind.camp_break(self.now, location) if kind == "prepare" else None
+            if reason is None:
+                self._schedule(staff, self._next_check(kind, action.ends_at))
+                return
+            commitment = self._world.interrupt_work(staff, self.now)
+            mind.preparations[commitment.target] = commitment
+            # The worker is still present and can see the slot they just released.
+            mind.memory.update(self._world.observe(staff, self.now))
+            self._record(staff, "interrupted", kind,
+                         f"target={commitment.target}, {reason}, {commitment.remaining}s remaining")
+
+        decision = mind.choose_camp(location, self.now, self._world.paths)
+        if decision is not None:
+            goal, request = decision
+            if self._start(staff, request, goal):
+                return
+        mind.travel_goal = None
+        self._schedule(staff, min(self.now + REASSESS, self.horizon))

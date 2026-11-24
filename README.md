@@ -28,3 +28,15 @@ Call `advance(seconds)` for headless runs or pass it to `Playback` for host-driv
 The camp uses a four-location graph with ten-minute links. The layout is public. Staff learn live supplies and occupancy by visiting the relevant location. They can use recent observations while away and may act on stale beliefs. The world checks current prerequisites again when accepting a request. Meals consume a serving at the start. The workshop starts with a finite list of damaged objects, configurable through `Scenario.repair_targets`. Staff discover damaged targets at the workshop. A completed repair changes one target to `repaired` for the rest of the scenario. Hunger can interrupt bench work. The staff member retains the remaining duration for that particular target and must find both a damaged target and a free bench to resume. Progress is private to the staff member. Another staff member starts a full repair and can invalidate the first staff member's commitment, which is abandoned upon observing the completed repair.
 
 The roster, need rates, resource capacities, and memory windows are prototype values. There is no conversation model or cross-session persistence. Reproduction consists of rerunning the same scenario, seed, and timed inputs. The event history is a diagnostic record. This milestone leaves rendering, engine selection, detailed geography, multiplayer, and horror or combat systems for later work.
+
+## M1 camp-life fixture
+
+M1 is opt-in. The default command still runs M0.
+
+```sh
+python3 -m summer_camp --scenario m1 --seed 42 --summary-only
+python3 -m summer_camp --scenario m1 --seed 42
+python3 -m unittest discover -s tests -v
+```
+
+The M1 fixture defaults to four simulated days and accepts `--days 1` through `--days 7`. See [M1 architecture, metrics, and sample trace](docs/m1-camp-life.md).
