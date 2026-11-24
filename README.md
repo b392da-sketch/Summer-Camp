@@ -40,3 +40,12 @@ python3 -m unittest discover -s tests -v
 ```
 
 The M1 fixture defaults to four simulated days and accepts `--days 1` through `--days 7`. See [M1 architecture, metrics, and sample trace](docs/m1-camp-life.md).
+
+## M2 social-life fixture
+
+```sh
+python3 -m summer_camp --scenario m2 --seed 42
+python3 -m summer_camp --scenario m2 --seed 42 --summary-only
+```
+
+M2 is opt-in and defaults to four days. See the [architecture, metrics, and causal trace](docs/m2-social-life.md).

@@ -8,6 +8,10 @@ from types import MappingProxyType
 
 from .clock import DAY, Clock
 from .cognition import CAMP_DESTINATIONS, REASSESS, Mind, Staff, route
+from .social import (
+    COOLDOWN, DURATION, PROMISE_WINDOW, Claim, Encounter, Exchange,
+    Help, Relationship, SocialMind, SocialProfile, bound, observed_job,
+)
 from .world import PATHS, Action, Job, Observation, Request, World
 
 MAX_DAYS = 7
@@ -45,6 +49,7 @@ class Scenario:
     servings: int = 200
     repair_targets: tuple[str, ...] = DEFAULT_REPAIRS
     camp: CampLayout | None = None
+    social: tuple[tuple[str, SocialProfile], ...] = ()
 
     def __post_init__(self):
         if type(self.days) is not int or not 1 <= self.days <= MAX_DAYS:
@@ -58,6 +63,14 @@ class Scenario:
         names = [staff.name for staff in self.staff]
         if not names or any(not name for name in names) or len(names) != len(set(names)):
             raise ValueError("Staff names must be nonempty and unique")
+        if self.social and self.camp is None:
+            raise ValueError("Social profiles require a camp layout")
+        social_names = [name for name, _ in self.social]
+        if len(social_names) != len(set(social_names)) or any(name not in names for name in social_names):
+            raise ValueError("Social profiles must identify distinct staff")
+        for name, profile in self.social:
+            if any(peer not in names or peer == name for peer in profile.acquaintances):
+                raise ValueError("Acquaintances must identify other staff")
         paths = self.camp.paths if self.camp is not None else PATHS
         if any((staff.profile is not None) != (self.camp is not None) for staff in self.staff):
             raise ValueError("Camp scenarios require a profile for every staff member")
@@ -98,6 +111,9 @@ class Simulation:
             sleep_durations={staff.name: staff.profile.sleep_duration for staff in scenario.staff
                              if staff.profile is not None} if camp is not None else None,
         )
+        self._social = {name: SocialMind.create(profile) for name, profile in scenario.social}
+        self._encounters: dict[int, Encounter] = {}
+        self._encounter_sequence = 0
         self._history: list[Event] = []
         self._wakes: dict[str, tuple[int, int]] = {}
         self._wake_sequence = 0
@@ -145,7 +161,122 @@ class Simulation:
                 ingredients=self._world.ingredients,
                 reserved_ingredients=self._world.ingredients - self._world.unreserved_ingredients,
             )
+        if self._social:
+            state["social"] = {staff: asdict(mind) for staff, mind in self._social.items()}
+            state["encounters"] = {key: asdict(value) for key, value in self._encounters.items()}
         return state
+
+    def propose_social(self, staff: str, exchange: Exchange) -> bool:
+        """Propose an encounter through the same consent and availability rules as AI."""
+        social = self._social.get(staff)
+        peer = exchange.peer
+        other = self._social.get(peer)
+        ends = self.now + DURATION
+        if (social is None or other is None or ends > self.horizon
+                or peer not in self._world.social_peers(staff, self.now)):
+            return False
+        if exchange.kind == "greet":
+            if exchange.location is not None or exchange.target is not None:
+                return False
+        elif (exchange.kind not in ("ask", "report", "help") or exchange.location not in self._world.paths
+              or not exchange.target or exchange.topic in social.topics):
+            return False
+        evidence = observed_job(self._minds[staff], exchange)
+        if exchange.kind in ("report", "help") and (evidence is None or
+                                                   (exchange.kind == "help" and evidence[0].done)):
+            return False
+        if self.now - social.approached.get(peer, -COOLDOWN) < COOLDOWN:
+            return False
+        for name in (staff, peer):
+            self._minds[name].accrue(self.now)
+        if not social.willing(self._minds[staff], peer, self.now):
+            return False
+        social.approached[peer] = self.now
+        if not other.willing(self._minds[peer], staff, self.now):
+            self._record(staff, "refused", "social", f"peer={peer}")
+            return False
+        if exchange.kind != "greet":
+            social.topics.add(exchange.topic)
+        other.heard[staff] = self.now
+        suspended = self._world.reserve_encounter(staff, peer, self.now, ends)
+        self._encounter_sequence += 1
+        key = self._encounter_sequence
+        self._encounters[key] = Encounter(staff, exchange, ends, suspended)
+        for name in (staff, peer):
+            self._wakes.pop(name, None)
+        self._record(staff, "started", "social", f"peer={peer} kind={exchange.kind}")
+        self._clock.schedule(ends, partial(self._close_encounter, key))
+        return True
+
+    def disengage(self, staff: str) -> bool:
+        """End an encounter without delivering its pending message."""
+        for key, encounter in self._encounters.items():
+            if staff in encounter.participants:
+                self._close_encounter(key, cancelled=True)
+                return True
+        return False
+
+    def _close_encounter(self, key: int, *, cancelled: bool = False) -> None:
+        encounter = self._encounters.pop(key, None)
+        if encounter is None:
+            return
+        staff, peer = encounter.participants
+        if cancelled:
+            detail = f"peer={peer} kind={encounter.exchange.kind}"
+        else:
+            detail = self._exchange(encounter)
+        self._record(staff, "cancelled" if cancelled else "completed", "social", detail)
+        for name, remaining in zip(encounter.participants, encounter.leisure_remaining):
+            self._world.release_encounter(name, remaining, self.now)
+            if self.now < self.horizon:
+                if remaining:
+                    self._schedule(name, min(self.now + remaining, self.now + REASSESS, self.horizon))
+                else:
+                    self._schedule(name, self.now)
+
+    def _exchange(self, encounter: Encounter) -> str:
+        staff, peer = encounter.participants
+        exchange = encounter.exchange
+        detail = f"peer={peer} kind={exchange.kind}"
+        for name, other in ((staff, peer), (peer, staff)):
+            mind = self._minds[name]
+            mind.accrue(self.now)
+            social = self._social[name]
+            social.last_exchange = self.now
+            relation = social.relationships.setdefault(other, Relationship())
+            relation.familiarity = min(5, relation.familiarity + 1)
+            if exchange.kind == "greet" and social.profile.company > 0:
+                relation.affinity = bound(relation.affinity + 1)
+        if exchange.kind == "greet":
+            return detail
+
+        source, listener = (peer, staff) if exchange.kind == "ask" else (staff, peer)
+        evidence = observed_job(self._minds[source], exchange)
+        if evidence is None:
+            return f"{detail} reply=unknown"
+        job, at = evidence
+        claim = Claim(source, exchange.location, exchange.target, "complete" if job.done else "pending",
+                      at, self.now)
+        recipient = self._social[listener]
+        recipient.claims.append(claim)
+        detail += (f" source={source} location={claim.location} target={claim.target}"
+                   f" value={claim.value} observed={claim.observed_at}")
+        if exchange.kind == "help":
+            mind = self._minds[listener]
+            if job.capability not in mind.profile.capabilities or recipient.profile.helpfulness < 0:
+                response = "declined"
+            elif (mind.camp_break(self.now, self._world.locations[listener])
+                  or any(promise.state == "accepted" for promise in recipient.help)):
+                response = "deferred"
+            else:
+                response = "accepted"
+            recipient.help.append(Help(claim, self.now + PROMISE_WINDOW, response))
+            self._social[staff].responses.append((listener, claim.target, response, self.now))
+            if response == "declined":
+                relation = self._social[staff].relationships[listener]
+                relation.affinity = bound(relation.affinity - 1)
+            detail += f" response={response}"
+        return detail
 
     def cancel_preparation(self, staff: str) -> bool:
         """Cancel an active M1 job, releasing reservations and discarding its progress."""
@@ -197,7 +328,10 @@ class Simulation:
                 del mind.preparations[commitment.target]
             else:
                 mind.repair_commitment = None
-        self._schedule(staff, self._next_check(kind, action.ends_at))
+        when = self._next_check(kind, action.ends_at)
+        if staff in self._social and kind == "leisure":
+            when = min(when, self.now + REASSESS, self.horizon)
+        self._schedule(staff, when)
         return True
 
     def _next_check(self, kind: str, ends_at: int) -> int:
@@ -219,6 +353,14 @@ class Simulation:
             if kind != "move":
                 mind.satisfy(kind)
             self._record(staff, "completed", kind, detail)
+            if kind == "prepare" and staff in self._social:
+                for promise in self._social[staff].help:
+                    if promise.claim.target == action.request.target and promise.state == "accepted":
+                        if self.now < promise.expires:
+                            promise.state = "fulfilled"
+                            self._record(staff, "fulfilled", "help", f"target={promise.claim.target}")
+                        else:
+                            promise.state = "expired"
             action = None
 
         observations = self._world.observe(staff, self.now)
@@ -274,13 +416,21 @@ class Simulation:
             if job.done and job.target in mind.preparations:
                 del mind.preparations[job.target]
                 self._record(staff, "abandoned", "prepare", f"target={job.target} completed by peer")
+        social = self._social.get(staff)
+        if social is not None:
+            social.assess(location, local_jobs.jobs if local_jobs is not None else (), self.now)
         if self.now == self.horizon:
             return
         if action is not None:
             kind = action.request.kind
             reason = mind.camp_break(self.now, location) if kind == "prepare" else None
             if reason is None:
-                self._schedule(staff, self._next_check(kind, action.ends_at))
+                if social is not None and kind == "leisure":
+                    if self._consider_social(staff, mind, social):
+                        return
+                    self._schedule(staff, min(action.ends_at, self.now + REASSESS, self.horizon))
+                else:
+                    self._schedule(staff, self._next_check(kind, action.ends_at))
                 return
             commitment = self._world.interrupt_work(staff, self.now)
             mind.preparations[commitment.target] = commitment
@@ -289,10 +439,20 @@ class Simulation:
             self._record(staff, "interrupted", kind,
                          f"target={commitment.target}, {reason}, {commitment.remaining}s remaining")
 
-        decision = mind.choose_camp(location, self.now, self._world.paths)
+        help_intent = social.intent(mind, location, self.now) if social is not None else None
+        seek_company = social is not None and social.seeks_company(self.now)
+        decision = mind.choose_camp(location, self.now, self._world.paths, help_intent, seek_company)
+        if social is not None and (decision is None or decision[0] == "leisure"):
+            if self._consider_social(staff, mind, social):
+                return
         if decision is not None:
             goal, request = decision
             if self._start(staff, request, goal):
                 return
         mind.travel_goal = None
         self._schedule(staff, min(self.now + REASSESS, self.horizon))
+
+    def _consider_social(self, staff: str, mind: Mind, social: SocialMind) -> bool:
+        peers = tuple(peer for peer in self._world.social_peers(staff, self.now) if peer in self._social)
+        exchange = social.proposal(mind, peers, self.now)
+        return exchange is not None and self.propose_social(staff, exchange)

@@ -173,6 +173,8 @@ class Mind:
 
     def choose_camp(
         self, location: str, now: int, paths: Mapping[str, tuple[str, ...]],
+        help_intent: tuple[str, Request] | None = None,
+        seek_company: bool = False,
     ) -> tuple[str, Request] | None:
         profile = self.profile
         assert profile is not None
@@ -202,6 +204,13 @@ class Mind:
         if points["leisure"] >= 25 and self.camp_available("leisure", now, location):
             offer(18 + points["leisure"] // 2 + self.preferences["leisure"],
                   "leisure", "commons", Request("leisure"))
+
+        if seek_company and location != "commons":
+            offer(26, "company", "commons", Request("leisure"))
+
+        if help_intent is not None:
+            destination, request = help_intent
+            offer(65, f"prepare:{destination}", destination, request)
 
         for facility in paths:
             goal = f"prepare:{facility}"
