@@ -4,13 +4,15 @@ import argparse
 from collections import Counter
 
 from .clock import DAY
+from .reference_camp import reference_camp
 from .simulation import MAX_DAYS, Scenario, Simulation
 from .world import Request
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--days", type=int, choices=range(1, MAX_DAYS + 1), default=1)
+    parser.add_argument("--scenario", choices=("m0", "m1"), default="m0")
+    parser.add_argument("--days", type=int, choices=range(1, MAX_DAYS + 1))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--summary-only", action="store_true")
     parser.add_argument(
@@ -18,10 +20,14 @@ def main() -> None:
         help="try an invalid meal request at the commons before autonomous decisions",
     )
     args = parser.parse_args()
-    run = Simulation(Scenario(days=args.days), seed=args.seed)
+    is_m1 = args.scenario == "m1"
+    if is_m1 and args.demo_failure:
+        parser.error("--demo-failure is only available for M0")
+    scenario = reference_camp(args.days or 4) if is_m1 else Scenario(days=args.days or 1)
+    run = Simulation(scenario, seed=args.seed)
     if args.demo_failure:
         run.submit("Ada", Request("meal"))
-    run.advance(args.days * DAY)
+    run.advance(scenario.days * DAY)
     if not args.summary_only:
         for event in run.history:
             day, remainder = divmod(event.at, DAY)
@@ -34,8 +40,18 @@ def main() -> None:
     state = run.snapshot()
     print(f"{run.now // DAY} simulated day(s), {len(run.history)} events")
     print("Completed: " + ", ".join(f"{kind}={count}" for kind, count in sorted(totals.items())))
-    repairs = sum(condition == "repaired" for condition in state["repair_states"].values())
-    print(f"Servings left: {state['servings']} | Repaired targets: {repairs}")
+    if is_m1:
+        print(f"Servings left: {state['servings']} | Ingredients left: {state['ingredients']}")
+        outcomes = Counter(state["job_states"].values())
+        print("Jobs: " + ", ".join(f"{condition}={count}" for condition, count in sorted(outcomes.items())))
+        counts = Counter((event.staff, event.action) for event in run.history if event.phase == "completed")
+        for staff in scenario.staff:
+            kinds = ("sleep", "meal", "leisure", "prepare")
+            metrics = ", ".join(f"{kind}={counts[staff.name, kind]}" for kind in kinds)
+            print(f"{staff.name} ({staff.profile.role}): {metrics}")
+    else:
+        repairs = sum(condition == "repaired" for condition in state["repair_states"].values())
+        print(f"Servings left: {state['servings']} | Repaired targets: {repairs}")
 
 
 if __name__ == "__main__":
