@@ -69,11 +69,23 @@ class Environment:
 
 
 @dataclass(frozen=True)
+class Stimulus:
+    at: int
+    location: str
+    visible_label: str
+    strength: int
+
+
+@dataclass(frozen=True)
 class PhysicalEvent:
     at: int
     fitting: Fitting
     cause: str
     opened: bool
+
+    @property
+    def stimulus(self) -> Stimulus:
+        return Stimulus(self.at, self.fitting.location, self.fitting.label, self.fitting.strength)
 
 
 @dataclass(frozen=True)
@@ -106,10 +118,12 @@ def sound_distances(source: str, links: tuple[Link, ...]) -> dict[str, int]:
 
 
 def project(
-    event: PhysicalEvent, environment: Environment, listener: str,
+    stimulus: PhysicalEvent | Stimulus, environment: Environment, listener: str,
     distances: dict[str, int], *, focused: bool = False,
 ) -> tuple[Evidence, ...]:
-    source = event.fitting.location
+    if isinstance(stimulus, PhysicalEvent):
+        stimulus = stimulus.stimulus
+    source = stimulus.location
     attention_loss = 1 if focused else 0
     cues = []
     sight_loss = 0 if listener == source else next(
@@ -117,13 +131,13 @@ def project(
          if {edge.first, edge.second} == {listener, source}), None,
     )
     if sight_loss is not None:
-        detail = environment.light(source, event.at) - sight_loss - attention_loss
+        detail = environment.light(source, stimulus.at) - sight_loss - attention_loss
         if detail >= 1:
-            label = event.fitting.label if detail >= 3 else None
-            cues.append(Evidence(event.at, "vision", "moving" if label else "motion", source, label))
+            label = stimulus.visible_label if detail >= 3 else None
+            cues.append(Evidence(stimulus.at, "vision", "moving" if label else "motion", source, label))
 
     if listener in distances:
-        strength = event.fitting.strength - distances[listener] - attention_loss
+        strength = stimulus.strength - distances[listener] - attention_loss
         if strength >= 2:
             direction = None
             if strength >= 4:
@@ -140,16 +154,20 @@ def project(
                     if len(approaches) == 1:
                         direction = approaches[0]
             detail = "clatter" if strength >= 4 else "indistinct noise"
-            cues.append(Evidence(event.at, "sound", detail, direction))
+            cues.append(Evidence(stimulus.at, "sound", detail, direction))
     return tuple(cues)
 
 
-def inspect(environment: Environment, location: str, now: int) -> tuple[Evidence, ...]:
+def inspect(
+    environment: Environment, location: str, now: int,
+    security: Mapping[str, bool],
+) -> tuple[Evidence, ...]:
     """Inspect current local conditions, with no access to past physical events."""
     if environment.light(location, now) + 1 < 3:
         return ()
     return tuple(
-        Evidence(now, "inspection", "loose latch" if item.loose else "secure latch", location, item.label)
+        Evidence(now, "inspection",
+                 "secure latch" if security[item.key] else "loose latch", location, item.label)
         for item in environment.fittings if item.location == location
     )
 
