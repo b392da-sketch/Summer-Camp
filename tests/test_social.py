@@ -160,6 +160,34 @@ class SocialTests(unittest.TestCase):
         self.assertEqual(run.snapshot()["social"]["Bo"]["relationships"], {})
         self.assertEqual(events(run, "social", "completed"), [])
 
+    def test_cancelled_report_can_be_retried_and_delivered_once(self):
+        roster = (staff("Alex", "boathouse", needs=(0, 0, 0, 0)), staff("Bo"))
+        run = Simulation(fixture(*roster, jobs=(RACK,)))
+        report = Exchange("Bo", "report", "boathouse", "rack")
+        run.advance(0)
+        self.assertTrue(run.submit("Alex", Request("move", "commons")))
+        run.advance(10 * MINUTE)
+        self.assertTrue(run.propose_social("Alex", report))
+        run.advance(MINUTE)
+        self.assertTrue(run.disengage("Bo"))
+        self.assertFalse(run.propose_social("Alex", report))
+        self.assertEqual(run.snapshot()["social"]["Bo"]["claims"], [])
+
+        run.advance(COOLDOWN - MINUTE)
+        self.assertEqual(run.snapshot()["social"]["Bo"]["claims"], [])
+        self.assertTrue(run.propose_social("Alex", report))
+        run.advance(DURATION)
+        state = run.snapshot()
+        self.assertEqual(state["social"]["Bo"]["claims"], [
+            {"speaker": "Alex", "location": "boathouse", "target": "rack", "value": "pending",
+             "observed_at": 0, "delivered_at": 10 * MINUTE + COOLDOWN + DURATION},
+        ])
+        self.assertIn(report.topic, state["social"]["Alex"]["topics"])
+        self.assertEqual(len(events(run, "social", "completed")), 1)
+        self.assertEqual(state["encounters"], {})
+        self.assertTrue(all(action["request"]["kind"] != "social"
+                            for action in state["active"].values()))
+
     def test_accepted_help_becomes_obsolete_after_inspection(self):
         roster = (staff("Alex", "boathouse", needs=(0, 0, 0, 0)),
                   staff("Bo", repair=True, needs=(0, 0, 0, 0)),

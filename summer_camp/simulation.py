@@ -195,8 +195,6 @@ class Simulation:
         if not other.willing(self._minds[peer], staff, self.now):
             self._record(staff, "refused", "social", f"peer={peer}")
             return False
-        if exchange.kind != "greet":
-            social.topics.add(exchange.topic)
         other.heard[staff] = self.now
         suspended = self._world.reserve_encounter(staff, peer, self.now, ends)
         self._encounter_sequence += 1
@@ -225,6 +223,8 @@ class Simulation:
             detail = f"peer={peer} kind={encounter.exchange.kind}"
         else:
             detail = self._exchange(encounter)
+            if encounter.exchange.kind != "greet":
+                self._social[staff].topics.add(encounter.exchange.topic)
         self._record(staff, "cancelled" if cancelled else "completed", "social", detail)
         for name, remaining in zip(encounter.participants, encounter.leisure_remaining):
             self._world.release_encounter(name, remaining, self.now)
