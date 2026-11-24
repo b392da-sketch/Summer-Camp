@@ -25,6 +25,14 @@ class TimeTests(unittest.TestCase):
         self.assertEqual(playback.update(Fraction(1, 3)), 1)
         self.assertEqual(clock.now, 7 * DAY + 1)
 
+    def test_playback_reports_applied_time_at_scenario_horizon(self):
+        run = Simulation(Scenario(days=1))
+        run.advance(DAY - 3)
+        playback = Playback(run.advance)
+        self.assertEqual(playback.update(1), 3)
+        self.assertEqual(run.now, DAY)
+        self.assertEqual(playback.update(1), 0)
+
     def test_scenario_limit_does_not_limit_clock(self):
         with self.assertRaises(ValueError):
             Scenario(days=8)
@@ -58,10 +66,15 @@ class SimulationTests(unittest.TestCase):
         completed = [event for event in run.history if event.phase == "completed"]
         activities = {"move", "meal", "work", "rest", "leisure"}
         for staff in ("Ada", "Ben", "Clara"):
-            self.assertEqual({event.action for event in completed if event.staff == staff}, activities)
+            self.assertTrue(activities - {"work"} <= {
+                event.action for event in completed if event.staff == staff
+            })
+        self.assertEqual({event.action for event in completed}, activities)
         self.assertTrue(all(event.action in activities for event in run.history))
-        self.assertGreater(state["repairs"], 0)
-        self.assertEqual(state["repairs"], sum(event.action == "work" for event in completed))
+        self.assertEqual(state["repair_states"], {
+            "canoe rack": "repaired", "supply cart": "repaired", "trail sign": "repaired"
+        })
+        self.assertEqual(sum(event.action == "work" for event in completed), 3)
         meals_started = sum(event.action == "meal" and event.phase == "started" for event in run.history)
         self.assertGreater(meals_started, 0)
         self.assertEqual(state["servings"], 200 - meals_started)
@@ -69,26 +82,80 @@ class SimulationTests(unittest.TestCase):
     def test_work_interruption_resumes_only_remaining_duration(self):
         run = Simulation(seed=42)
         run.advance(219 * MINUTE)
-        self.assertIn(Event(115 * MINUTE, "Clara", "interrupted", "work", "hunger, 2400s remaining"),
+        self.assertIn(Event(115 * MINUTE, "Clara", "interrupted", "work", "target=canoe rack, hunger, 2400s remaining"),
                       run.history)
-        self.assertIn(Event(180 * MINUTE, "Clara", "resumed", "work"), run.history)
+        self.assertIn(Event(180 * MINUTE, "Clara", "resumed", "work", "target=canoe rack"), run.history)
         self.assertTrue(any(event.staff == "Clara" and event.action == "meal"
                             and event.phase == "completed" for event in run.history))
-        self.assertEqual(run.snapshot()["repairs"], 0)
+        self.assertEqual(run.snapshot()["repair_states"]["canoe rack"], "damaged")
         run.advance(MINUTE)
-        self.assertIn(Event(220 * MINUTE, "Clara", "completed", "work", "repairs=1"), run.history)
+        self.assertIn(Event(220 * MINUTE, "Clara", "completed", "work", "target=canoe rack damaged -> repaired"),
+                      run.history)
+        self.assertEqual(run.snapshot()["repair_states"]["canoe rack"], "repaired")
 
     def test_interrupted_work_waits_if_another_staff_member_takes_bench(self):
         ada = Staff("Ada", "workshop", (67, 0, 95, 0), NEUTRAL)
         ben = Staff("Ben", "workshop", NEUTRAL, (-200, -200, -200, -200))
         run = Simulation(Scenario(staff=(ada, ben)))
         run.advance(80 * MINUTE)
-        self.assertIn(Event(15 * MINUTE, "Ada", "interrupted", "work", "hunger, 5100s remaining"),
+        self.assertIn(Event(15 * MINUTE, "Ada", "interrupted", "work", "target=canoe rack, hunger, 5100s remaining"),
                       run.history)
-        self.assertIn(Event(15 * MINUTE, "Ben", "started", "work"), run.history)
+        self.assertIn(Event(15 * MINUTE, "Ben", "started", "work", "target=canoe rack"), run.history)
         self.assertIn(Event(80 * MINUTE, "Ada", "redirected", "work", "resource occupied"), run.history)
         self.assertFalse(any(event.phase == "resumed" for event in run.history))
-        self.assertEqual(run.snapshot()["minds"]["Ada"]["work_remaining"], 5100)
+        self.assertEqual(run.snapshot()["minds"]["Ada"]["repair_commitment"],
+                         {"target": "canoe rack", "remaining": 5100})
+
+    def test_peer_completion_invalidates_commitment_and_replacement_takes_full_time(self):
+        ada = Staff("Ada", "workshop", (67, 0, 95, 0), NEUTRAL)
+        ben = Staff("Ben", "workshop", NEUTRAL, (-200, -200, -200, -200))
+        run = Simulation(Scenario(staff=(ada, ben), repair_targets=("canoe rack", "supply cart")))
+        run.advance(80 * MINUTE)
+        self.assertEqual(run.snapshot()["minds"]["Ada"]["repair_commitment"]["target"], "canoe rack")
+        run.advance(35 * MINUTE)
+        rack_done = Event(115 * MINUTE, "Ben", "completed", "work",
+                          "target=canoe rack damaged -> repaired")
+        self.assertIn(rack_done, run.history)
+        self.assertEqual(run.snapshot()["minds"]["Ada"]["repair_commitment"]["target"], "canoe rack")
+
+        run.advance(30 * MINUTE)
+        self.assertIn(Event(145 * MINUTE, "Ada", "abandoned", "work",
+                            "target=canoe rack no longer damaged"), run.history)
+        self.assertIn(Event(145 * MINUTE, "Ada", "started", "work", "target=supply cart"), run.history)
+        self.assertIsNone(run.snapshot()["minds"]["Ada"]["repair_commitment"])
+        self.assertEqual(run.snapshot()["active"]["Ada"]["ends_at"], 245 * MINUTE)
+        run.advance(DAY)
+        self.assertEqual([event for event in run.history
+                          if event.phase == "completed" and event.action == "work"], [
+            rack_done,
+            Event(245 * MINUTE, "Ada", "completed", "work", "target=supply cart damaged -> repaired"),
+        ])
+
+    def test_repaired_target_rejects_repeat_and_remains_repaired(self):
+        staff = Staff("Ada", "workshop", (0, 0, 95, 0), (-200, -200, 0, -200))
+        run = Simulation(Scenario(staff=(staff,), repair_targets=("trail sign",)))
+        self.assertEqual(run.snapshot()["repair_states"], {"trail sign": "damaged"})
+        run.advance(100 * MINUTE)
+        self.assertEqual(run.snapshot()["repair_states"], {"trail sign": "repaired"})
+        self.assertFalse(run.submit("Ada", Request("work", target="trail sign")))
+        self.assertEqual(run.history[-1], Event(6000, "Ada", "failed", "work", "repair target is unavailable"))
+        run.advance(DAY)
+        self.assertEqual(run.snapshot()["repair_states"], {"trail sign": "repaired"})
+        self.assertEqual([event.phase for event in run.history if event.action == "work"],
+                         ["started", "completed", "failed"])
+
+    def test_repair_availability_is_learned_at_the_workshop(self):
+        staff = Staff("Ada", "commons", (0, 0, 95, 45), NEUTRAL)
+        empty = Simulation(Scenario(staff=(staff,), repair_targets=()))
+        damaged = Simulation(Scenario(staff=(staff,), repair_targets=("trail sign",)))
+        for run in (empty, damaged):
+            run.advance(599)
+            self.assertNotIn("work", run.snapshot()["minds"]["Ada"]["memory"])
+        self.assertEqual(empty.history, damaged.history)
+        empty.advance(1)
+        damaged.advance(1)
+        self.assertIn(Event(600, "Ada", "redirected", "work", "no damaged targets observed"), empty.history)
+        self.assertIn(Event(600, "Ada", "started", "work", "target=trail sign"), damaged.history)
 
     def test_autonomous_contention_changes_another_agents_choice(self):
         first = Staff("First", "workshop", (0, 0, 95, 0), NEUTRAL)
@@ -98,10 +165,10 @@ class SimulationTests(unittest.TestCase):
         for run in (contested, available):
             run.advance(10 * MINUTE)
             self.assertIn(Event(0, "Second", "started", "move", "to=workshop goal=work"), run.history)
-        self.assertIn(Event(0, "First", "started", "work"), contested.history)
+        self.assertIn(Event(0, "First", "started", "work", "target=canoe rack"), contested.history)
         self.assertIn(Event(600, "Second", "redirected", "work", "resource occupied"), contested.history)
         self.assertIn(Event(600, "Second", "started", "move", "to=commons goal=leisure"), contested.history)
-        self.assertIn(Event(600, "Second", "started", "work"), available.history)
+        self.assertIn(Event(600, "Second", "started", "work", "target=canoe rack"), available.history)
 
     def test_unobserved_supply_does_not_change_choice_until_arrival(self):
         staff = Staff("Ada", "commons", (90, 0, 0, 45), NEUTRAL)

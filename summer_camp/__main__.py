@@ -34,7 +34,8 @@ def main() -> None:
     state = run.snapshot()
     print(f"{run.now // DAY} simulated day(s), {len(run.history)} events")
     print("Completed: " + ", ".join(f"{kind}={count}" for kind, count in sorted(totals.items())))
-    print(f"Servings left: {state['servings']} | Repairs: {state['repairs']}")
+    repairs = sum(condition == "repaired" for condition in state["repair_states"].values())
+    print(f"Servings left: {state['servings']} | Repaired targets: {repairs}")
 
 
 if __name__ == "__main__":

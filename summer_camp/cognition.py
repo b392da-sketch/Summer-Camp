@@ -4,7 +4,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from random import Random
 
-from .world import ACTIVITIES, MINUTE, PATHS, Observation, Request
+from .world import ACTIVITIES, MINUTE, PATHS, Observation, RepairCommitment, Request
 
 REASSESS = 15 * MINUTE
 MEMORY_WINDOW = 60 * MINUTE
@@ -27,7 +27,7 @@ class Mind:
     needs: dict[str, int]
     preferences: dict[str, int]
     memory: dict[str, Observation] = field(default_factory=dict)
-    work_remaining: int | None = None
+    repair_commitment: RepairCommitment | None = None
     travel_goal: str | None = None
     last_update: int = 0
 
@@ -65,7 +65,12 @@ class Mind:
 
     def _available(self, kind: str, now: int) -> bool:
         seen = self.memory.get(kind)
-        if seen is None or now - seen.at >= MEMORY_WINDOW:
+        if seen is None:
+            return True
+        # A fully repaired workshop stays that way in M0.
+        if kind == "work" and not seen.damaged_targets:
+            return False
+        if now - seen.at >= MEMORY_WINDOW:
             return True
         if seen.servings == 0:
             return False
@@ -85,18 +90,28 @@ class Mind:
                 continue
             steps = route(location, activity.location)
             score = self.needs[kind] // REASSESS + self.preferences[kind] - 6 * len(steps)
-            if kind == "work" and self.work_remaining is not None:
+            if kind == "work" and self.repair_commitment is not None:
                 score += 25
             if activity.location == location or score >= 15:
                 candidates.append((score, kind, steps))
         if not candidates:
             return None
         _, kind, steps = max(candidates, key=lambda candidate: candidate[0])
-        return kind, Request("move", steps[0]) if steps else Request(kind)
+        return kind, self._request(kind, steps)
 
     def request_for(self, kind: str, location: str) -> Request:
         steps = route(location, ACTIVITIES[kind].location)
-        return Request("move", steps[0]) if steps else Request(kind)
+        return self._request(kind, steps)
+
+    def _request(self, kind: str, steps: tuple[str, ...]) -> Request:
+        if steps:
+            return Request("move", steps[0])
+        if kind == "work":
+            targets = self.memory["work"].damaged_targets
+            commitment = self.repair_commitment
+            target = commitment.target if commitment is not None else targets[0]
+            return Request("work", target=target)
+        return Request(kind)
 
 
 def route(origin: str, destination: str) -> tuple[str, ...]:

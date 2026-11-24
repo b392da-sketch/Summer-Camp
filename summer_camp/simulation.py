@@ -9,6 +9,7 @@ from .cognition import REASSESS, Mind, Staff
 from .world import PATHS, Request, World
 
 MAX_DAYS = 7
+DEFAULT_REPAIRS = ("canoe rack", "supply cart", "trail sign")
 DEFAULT_STAFF = (Staff("Ada"), Staff("Ben"), Staff("Clara"))
 
 
@@ -17,12 +18,17 @@ class Scenario:
     staff: tuple[Staff, ...] = DEFAULT_STAFF
     days: int = MAX_DAYS
     servings: int = 200
+    repair_targets: tuple[str, ...] = DEFAULT_REPAIRS
 
     def __post_init__(self):
         if type(self.days) is not int or not 1 <= self.days <= MAX_DAYS:
             raise ValueError("Scenario duration must be one to seven whole days")
         if type(self.servings) is not int or self.servings < 0:
             raise ValueError("Servings must be a nonnegative integer")
+        if any(not target for target in self.repair_targets):
+            raise ValueError("Repair targets must be named")
+        if len(self.repair_targets) != len(set(self.repair_targets)):
+            raise ValueError("Repair target names must be unique")
         names = [staff.name for staff in self.staff]
         if not names or any(not name for name in names) or len(names) != len(set(names)):
             raise ValueError("Staff names must be nonempty and unique")
@@ -45,7 +51,11 @@ class Simulation:
         self._clock = Clock()
         rng = Random(seed)
         self._minds = {staff.name: Mind.create(staff, rng) for staff in scenario.staff}
-        self._world = World({staff.name: staff.location for staff in scenario.staff}, scenario.servings)
+        self._world = World(
+            {staff.name: staff.location for staff in scenario.staff},
+            scenario.servings,
+            scenario.repair_targets,
+        )
         self._history: list[Event] = []
         self._wakes: dict[str, tuple[int, int]] = {}
         self._wake_sequence = 0
@@ -60,10 +70,10 @@ class Simulation:
     def history(self) -> tuple[Event, ...]:
         return tuple(self._history)
 
-    def advance(self, seconds: int) -> None:
+    def advance(self, seconds: int) -> int:
         if type(seconds) is not int or seconds < 0:
             raise ValueError("Advance by a nonnegative integer number of seconds")
-        self._clock.advance(min(seconds, self.horizon - self.now))
+        return self._clock.advance(min(seconds, self.horizon - self.now))
 
     def submit(self, staff: str, request: Request) -> bool:
         """Try an immediate external input at the current simulated timestamp."""
@@ -81,7 +91,7 @@ class Simulation:
             "horizon": self.horizon,
             "locations": dict(self._world.locations),
             "servings": self._world.servings,
-            "repairs": self._world.repairs,
+            "repair_states": dict(self._world.repair_states),
             "active": {staff: asdict(action) for staff, action in self._world.active.items()},
             "minds": {staff: asdict(mind) for staff, mind in self._minds.items()},
             "scheduled": sorted((when, sequence, staff) for staff, (when, sequence) in self._wakes.items()),
@@ -98,19 +108,26 @@ class Simulation:
 
     def _start(self, staff: str, request: Request, goal: str | None = None) -> bool:
         mind = self._minds[staff]
+        commitment = mind.repair_commitment
         try:
-            action = self._world.start(staff, request, self.now, mind.work_remaining)
+            action = self._world.start(staff, request, self.now, commitment)
         except ValueError as error:
             self._record(staff, "failed", request.kind, str(error))
             return False
 
         kind = request.kind
-        phase = "resumed" if kind == "work" and mind.work_remaining is not None else "started"
-        detail = f"to={request.destination} goal={goal or 'external'}" if kind == "move" else ""
+        phase = "started"
+        detail = ""
+        if kind == "work":
+            detail = f"target={request.target}"
+            if commitment is not None and request.target == commitment.target:
+                phase = "resumed"
+        elif kind == "move":
+            detail = f"to={request.destination} goal={goal or 'external'}"
         self._record(staff, phase, kind, detail)
         mind.travel_goal = goal if kind == "move" else None
-        if kind == "work":
-            mind.work_remaining = None
+        if phase == "resumed":
+            mind.repair_commitment = None
         self._schedule(staff, self._next_check(kind, action.ends_at))
         return True
 
@@ -134,20 +151,33 @@ class Simulation:
 
         observations = self._world.observe(staff, self.now)
         mind.memory.update(observations)
+        commitment = mind.repair_commitment
+        if commitment is not None and "work" in observations:
+            if commitment.target not in observations["work"].damaged_targets:
+                mind.repair_commitment = None
+                self._record(staff, "abandoned", "work", f"target={commitment.target} no longer damaged")
         if self.now == self.horizon:
             return
         if action:
             if action.request.kind != "work" or not mind.wants_meal_break(self.now):
                 self._schedule(staff, self._next_check(action.request.kind, action.ends_at))
                 return
-            mind.work_remaining = self._world.interrupt_work(staff, self.now)
-            self._record(staff, "interrupted", "work", f"hunger, {mind.work_remaining}s remaining")
+            commitment = self._world.interrupt_work(staff, self.now)
+            mind.repair_commitment = commitment
+            self._record(staff, "interrupted", "work",
+                         f"target={commitment.target}, hunger, {commitment.remaining}s remaining")
 
         intended = mind.travel_goal
         if intended in observations:
             seen = observations[intended]
-            if seen.free == 0 or seen.servings == 0:
-                reason = "no servings observed" if seen.servings == 0 else "resource occupied"
+            reason = None
+            if seen.servings == 0:
+                reason = "no servings observed"
+            elif intended == "work" and not seen.damaged_targets:
+                reason = "no damaged targets observed"
+            elif seen.free == 0:
+                reason = "resource occupied"
+            if reason is not None:
                 self._record(staff, "redirected", intended, reason)
                 mind.travel_goal = None
 

@@ -34,6 +34,7 @@ ACTIVITIES = MappingProxyType({
 class Request:
     kind: str
     destination: str | None = None
+    target: str | None = None
 
 
 @dataclass(frozen=True)
@@ -41,7 +42,13 @@ class Observation:
     at: int
     free: int
     servings: int | None = None
-    repairs: int | None = None
+    damaged_targets: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RepairCommitment:
+    target: str
+    remaining: int
 
 
 @dataclass(frozen=True)
@@ -51,10 +58,10 @@ class Action:
 
 
 class World:
-    def __init__(self, starting_locations: dict[str, str], servings: int):
+    def __init__(self, starting_locations: dict[str, str], servings: int, repair_targets: tuple[str, ...]):
         self.locations = dict(starting_locations)
         self.servings = servings
-        self.repairs = 0
+        self.repair_states = dict.fromkeys(repair_targets, "damaged")
         self.active: dict[str, Action] = {}
 
     def observe(self, staff: str, now: int) -> dict[str, Observation]:
@@ -64,7 +71,8 @@ class World:
             kind: Observation(
                 now, self.free_slots(kind),
                 self.servings if kind == "meal" else None,
-                self.repairs if kind == "work" else None,
+                tuple(target for target, state in self.repair_states.items() if state == "damaged")
+                if kind == "work" else (),
             )
             for kind, activity in ACTIVITIES.items()
             if self.locations[staff] == activity.location
@@ -75,12 +83,14 @@ class World:
         return ACTIVITIES[kind].capacity - occupied
 
     def start(
-        self, staff: str, request: Request, now: int, work_remaining: int | None
+        self, staff: str, request: Request, now: int, commitment: RepairCommitment | None
     ) -> Action:
         if staff in self.active:
             raise ValueError("already occupied")
         kind = request.kind
         location = self.locations[staff]
+        if kind != "work" and request.target is not None:
+            raise ValueError("unexpected repair target")
         if kind == "move":
             if request.destination not in PATHS[location]:
                 raise ValueError("destination is not adjacent")
@@ -95,7 +105,12 @@ class World:
                 raise ValueError("resource occupied")
             if kind == "meal" and self.servings == 0:
                 raise ValueError("no servings available")
-            duration = work_remaining if kind == "work" and work_remaining else activity.duration
+            duration = activity.duration
+            if kind == "work":
+                if self.repair_states.get(request.target) != "damaged":
+                    raise ValueError("repair target is unavailable")
+                if commitment is not None and commitment.target == request.target:
+                    duration = commitment.remaining
 
         action = Action(request, now + duration)
         self.active[staff] = action
@@ -112,13 +127,17 @@ class World:
             self.locations[staff] = destination
             detail = destination
         elif kind == "work":
-            self.repairs += 1
-            detail = f"repairs={self.repairs}"
+            target = self.active[staff].request.target
+            assert target is not None and self.repair_states[target] == "damaged"
+            self.repair_states[target] = "repaired"
+            detail = f"target={target} damaged -> repaired"
         del self.active[staff]
         return detail
 
-    def interrupt_work(self, staff: str, now: int) -> int:
+    def interrupt_work(self, staff: str, now: int) -> RepairCommitment:
         action = self.active[staff]
         assert action.request.kind == "work" and now < action.ends_at
         del self.active[staff]
-        return action.ends_at - now
+        target = action.request.target
+        assert target is not None
+        return RepairCommitment(target, action.ends_at - now)

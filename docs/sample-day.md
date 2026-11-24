@@ -12,7 +12,7 @@ Day 1 00:55:00  Ada    started     meal
 Day 1 00:55:00  Ben    completed   move (kitchen)
 Day 1 00:55:00  Ben    started     meal
 Day 1 00:55:00  Clara  completed   move (workshop)
-Day 1 00:55:00  Clara  started     work
+Day 1 00:55:00  Clara  started     work (target=canoe rack)
 Day 1 01:20:00  Ben    completed   meal
 Day 1 01:20:00  Ben    started     move (to=commons goal=work)
 Day 1 01:40:00  Ada    started     rest
@@ -30,14 +30,14 @@ Day 1 02:40:00  Clara  started     move (to=commons goal=work)
 Day 1 02:50:00  Clara  completed   move (commons)
 Day 1 02:50:00  Clara  started     move (to=workshop goal=work)
 Day 1 03:00:00  Clara  completed   move (workshop)
-Day 1 03:00:00  Clara  resumed     work
+Day 1 03:00:00  Clara  resumed     work (target=canoe rack)
 Day 1 03:40:00  Ada    completed   rest
 Day 1 03:40:00  Ada    started     move (to=commons goal=meal)
-Day 1 03:40:00  Clara  completed   work (repairs=1)
+Day 1 03:40:00  Clara  completed   work (target=canoe rack damaged -> repaired)
 Day 1 03:40:00  Clara  started     move (to=commons goal=rest)
-1 simulated day(s), 345 events
-Completed: leisure=12, meal=23, move=108, rest=10, work=8
-Servings left: 177 | Repairs: 8
+1 simulated day(s), 354 events
+Completed: leisure=17, meal=26, move=109, rest=11, work=3
+Servings left: 174 | Repaired targets: 3
 ```
 
-The first line comes from an explicit test input. Ada is at the commons, so the meal request fails before a serving is taken. The rest of the trace comes from autonomous decisions. Ben heads to the workshop while Clara is working there. On arrival he sees the occupied bench and changes his goal to rest. Clara later releases the bench when hunger interrupts her work. After eating, she returns to the workshop, finds a free bench, and completes the forty remaining minutes of work. The repair total changes at completion.
+The first line comes from an explicit test input. Ada is at the commons, so the meal request fails before a serving is taken. The rest of the trace comes from autonomous decisions. Ben heads to the workshop while Clara is working there. On arrival he sees the occupied bench and changes his goal to rest. Clara later releases the bench when hunger interrupts her work. After eating, she returns to the workshop, finds a free bench, and completes the forty remaining minutes of work. The canoe rack changes from `damaged` to `repaired` at completion.

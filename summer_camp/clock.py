@@ -20,7 +20,7 @@ class Clock:
         heappush(self._events, (when, self._sequence, callback))
         self._sequence += 1
 
-    def advance(self, seconds: int) -> None:
+    def advance(self, seconds: int) -> int:
         if type(seconds) is not int or seconds < 0:
             raise ValueError("Advance by a nonnegative integer number of seconds")
         target = self.now + seconds
@@ -28,12 +28,13 @@ class Clock:
             self.now, _, callback = heappop(self._events)
             callback()
         self.now = target
+        return seconds
 
 
 class Playback:
     """Convert elapsed real time supplied by a host into integer simulation steps."""
 
-    def __init__(self, advance: Callable[[int], None], rate: int | Fraction = NORMAL_RATE):
+    def __init__(self, advance: Callable[[int], int], rate: int | Fraction = NORMAL_RATE):
         self._advance = advance
         self._carry = Fraction(0)
         self.paused = False
@@ -51,6 +52,7 @@ class Playback:
         self._rate = rate
 
     def update(self, elapsed: int | Fraction) -> int:
+        """Return the simulated seconds applied by the advance callback."""
         elapsed = Fraction(elapsed)
         if elapsed < 0:
             raise ValueError("Elapsed time must be nonnegative")
@@ -58,7 +60,6 @@ class Playback:
             return 0
         total = self._carry + elapsed * self.rate
         seconds = int(total)
-        if seconds:
-            self._advance(seconds)
+        applied = self._advance(seconds) if seconds else 0
         self._carry = total - seconds
-        return seconds
+        return applied
