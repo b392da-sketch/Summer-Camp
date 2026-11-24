@@ -83,6 +83,7 @@ class EcologyState:
     raccoon: Animal = field(init=False)
     scraps: int = 0
     tipped: bool = False
+    container_revision: int = 0
 
     def __post_init__(self):
         self.wind = self.config.initial_wind
@@ -146,6 +147,7 @@ class EcologyState:
         if self.tipped:
             return None
         self.tipped = True
+        self.container_revision += 1
         return Incident("raccoon contact", "refuse container", "tipped",
                         Stimulus(now, self.config.refuse, "raccoon", 8))
 

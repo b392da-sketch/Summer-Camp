@@ -76,3 +76,12 @@ python3 -m summer_camp --scenario m5 --seed 42 --summary-only
 ```
 
 M5 is opt-in and defaults to four days. See the [architecture, metrics, and controlled causal trace](docs/m5-ecology.md).
+
+## M6 adaptive maintenance fixture
+
+```sh
+python3 -m summer_camp --scenario m6 --seed 0
+python3 -m summer_camp --scenario m6 --seed 42 --summary-only
+```
+
+M6 is opt-in and defaults to four days. See the [architecture, replay metrics, and causal comparisons](docs/m6-maintenance.md).

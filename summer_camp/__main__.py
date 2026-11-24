@@ -5,14 +5,14 @@ from functools import partial
 from collections import Counter
 
 from .clock import DAY
-from .reference_camp import ecology_camp, perception_camp, reference_camp, social_camp, witness_camp
+from .reference_camp import ecology_camp, maintenance_camp, perception_camp, reference_camp, social_camp, witness_camp
 from .simulation import MAX_DAYS, Scenario, Simulation
 from .world import Request
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scenario", choices=("m0", "m1", "m2", "m3", "m4", "m5"), default="m0")
+    parser.add_argument("--scenario", choices=("m0", "m1", "m2", "m3", "m4", "m5", "m6"), default="m0")
     parser.add_argument("--days", type=int, choices=range(1, MAX_DAYS + 1))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--summary-only", action="store_true")
@@ -29,7 +29,8 @@ def main() -> None:
                  "m2": partial(social_camp, args.days or 4),
                  "m3": partial(perception_camp, args.days or 4),
                  "m4": partial(witness_camp, args.days or 4),
-                 "m5": partial(ecology_camp, args.days or 4)}
+                 "m5": partial(ecology_camp, args.days or 4),
+                 "m6": partial(maintenance_camp, args.days or 4)}
     scenario = scenarios[args.scenario]()
     run = Simulation(scenario, seed=args.seed)
     if args.demo_failure:

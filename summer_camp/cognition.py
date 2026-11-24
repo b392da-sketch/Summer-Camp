@@ -176,6 +176,7 @@ class Mind:
         help_intent: tuple[str, Request] | None = None,
         seek_company: bool = False,
         inspection: tuple[str, int] | None = None,
+        upkeep: tuple[str, int, Request] | None = None,
     ) -> tuple[str, Request] | None:
         profile = self.profile
         assert profile is not None
@@ -205,6 +206,10 @@ class Mind:
         if points["leisure"] >= 25 and self.camp_available("leisure", now, location):
             offer(18 + points["leisure"] // 2 + self.preferences["leisure"],
                   "leisure", "commons", Request("leisure"))
+
+        if upkeep is not None:
+            yard, score, request = upkeep
+            offer(score, f"maintenance:{yard}", yard, request)
 
         if inspection is not None:
             destination, score = inspection

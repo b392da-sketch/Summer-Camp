@@ -80,7 +80,7 @@ class TestimonyMind:
         expires = cue.at + CUE_LIFETIME
         if self.pending is not None and now >= self.pending.expires:
             self.pending = None
-        if (assessment == "credible" and cue.area is not None and cue.modality != "inspection"
+        if (assessment == "credible" and cue.area is not None and cue.modality in ("vision", "sound")
                 and now < expires and self.pending is None and self.travelling is None):
             score = 31 + curiosity + 2 * trust - (4 if payload.relayed else 0)
             self.pending = Investigation(testimony.origin, cue.area, expires, score, False)
@@ -111,10 +111,10 @@ class TestimonyMind:
     def compare(self, cues: tuple[Evidence, ...]) -> None:
         for account in self.accounts.values():
             original = account.delivery.testimony.cue
-            if original.modality != "inspection" or account.compared is not None:
+            if original.modality not in ("inspection", "notice") or account.compared is not None:
                 continue
             for current in cues:
-                if (current.modality == "inspection" and current.area == original.area
+                if (current.modality in ("inspection", "notice") and current.area == original.area
                         and current.label == original.label and current.at > original.at):
                     account.compared = ("locally consistent" if current.detail == original.detail
                                         else "locally different")

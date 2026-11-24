@@ -4,6 +4,7 @@ from dataclasses import replace
 
 from .cognition import HOUR, Staff, StaffProfile
 from .ecology import Ecology, Trail
+from .maintenance import Maintenance
 from .perception import Environment, Fitting, Link
 from .simulation import CampLayout, Scenario
 from .social import SocialProfile
@@ -106,3 +107,15 @@ def ecology_camp(days: int = 4) -> Scenario:
     ecology = Ecology(("commons", "woodland", "shore path", "service yard"), fitting.key,
                       "woodland", "service yard", (Trail("woodland", "service yard"),))
     return replace(camp, camp=layout, environment=environment, ecology=ecology)
+
+def maintenance_camp(days: int = 4) -> Scenario:
+    camp = ecology_camp(days)
+    assert camp.camp is not None
+    paths = dict(camp.camp.paths)
+    paths["commons"] = tuple("service yard" if node == "kitchen" else node
+                             for node in paths["commons"])
+    paths["kitchen"] = ("service yard",)
+    paths["service yard"] = ("commons", "kitchen", "woodland")
+    layout = replace(camp.camp, paths=paths)
+    return replace(camp, camp=layout,
+                   maintenance=Maintenance(("commons", "service yard"), "service yard"))
