@@ -1,7 +1,10 @@
 """The provisional, opt-in six-person M1 scenario."""
 
+from dataclasses import replace
+
 from .cognition import HOUR, Staff, StaffProfile
 from .simulation import CampLayout, Scenario
+from .social import SocialProfile
 from .world import MINUTE, Job
 
 PATHS = {
@@ -40,3 +43,13 @@ def reference_camp(days: int = 4) -> Scenario:
         for index, (name, role, duties, skills, bed, preferences) in enumerate(roster)
     )
     return Scenario(staff=staff, days=days, servings=16, camp=CampLayout(PATHS, JOBS, 18))
+
+
+def social_camp(days: int = 4) -> Scenario:
+    camp = reference_camp(days)
+    temperaments = ((1, 0), (0, 1), (-3, 1), (1, 1), (2, 0), (-1, -1))
+    profiles = tuple(
+        (staff.name, SocialProfile(company, helpfulness, ("Morgan",) if index == 0 else ()))
+        for index, (staff, (company, helpfulness)) in enumerate(zip(camp.staff, temperaments))
+    )
+    return replace(camp, social=profiles)

@@ -117,6 +117,33 @@ class World:
             }
 
 
+    def social_peers(self, staff: str, now: int) -> tuple[str, ...]:
+        if not self._social_available(staff, now):
+            return ()
+        return tuple(peer for peer in self.locations
+                     if peer != staff and self.locations[peer] == self.locations[staff]
+                     and self._social_available(peer, now))
+
+    def _social_available(self, staff: str, now: int) -> bool:
+        action = self.active.get(staff)
+        return action is None or (action.request.kind == "leisure" and action.ends_at > now)
+
+    def reserve_encounter(self, staff: str, peer: str, now: int, ends: int) -> tuple[int, int]:
+        if peer not in self.social_peers(staff, now):
+            raise ValueError("participants must be co-present and available")
+        suspended = tuple(max(0, self.active[name].ends_at - now) if name in self.active else 0
+                          for name in (staff, peer))
+        for name in (staff, peer):
+            self.active[name] = Action(Request("social"), ends)
+        return suspended
+
+    def release_encounter(self, staff: str, leisure_remaining: int, now: int) -> None:
+        assert self.active[staff].request.kind == "social"
+        if leisure_remaining:
+            self.active[staff] = Action(Request("leisure"), now + leisure_remaining)
+        else:
+            del self.active[staff]
+
     def observe(self, staff: str, now: int) -> dict[str, Observation]:
         if staff in self.active and self.active[staff].request.kind in ("move", "sleep"):
             return {}
