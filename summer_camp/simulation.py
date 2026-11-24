@@ -8,6 +8,9 @@ from types import MappingProxyType
 
 from .clock import DAY, Clock
 from .cognition import CAMP_DESTINATIONS, REASSESS, Mind, Staff, route
+from .perception import (
+    HOUR, MINUTE, Environment, Evidence, PerceptionMind, inspect, project, sound_distances,
+)
 from .social import (
     COOLDOWN, DURATION, PROMISE_WINDOW, Claim, Encounter, Exchange,
     Help, Relationship, SocialMind, SocialProfile, bound, observed_job,
@@ -50,6 +53,7 @@ class Scenario:
     repair_targets: tuple[str, ...] = DEFAULT_REPAIRS
     camp: CampLayout | None = None
     social: tuple[tuple[str, SocialProfile], ...] = ()
+    environment: Environment | None = None
 
     def __post_init__(self):
         if type(self.days) is not int or not 1 <= self.days <= MAX_DAYS:
@@ -81,6 +85,10 @@ class Scenario:
                 raise ValueError("Responsibilities must use known facilities")
         if any(staff.location not in paths for staff in self.staff):
             raise ValueError("Staff must start at a camp location")
+        if self.environment is not None:
+            if self.camp is None:
+                raise ValueError("Environmental perception requires a camp layout")
+            self.environment.validate(paths, names)
 
 
 @dataclass(frozen=True)
@@ -110,6 +118,7 @@ class Simulation:
                           if staff.profile is not None},
             sleep_durations={staff.name: staff.profile.sleep_duration for staff in scenario.staff
                              if staff.profile is not None} if camp is not None else None,
+            environment=scenario.environment,
         )
         self._social = {name: SocialMind.create(profile) for name, profile in scenario.social}
         self._encounters: dict[int, Encounter] = {}
@@ -117,8 +126,69 @@ class Simulation:
         self._history: list[Event] = []
         self._wakes: dict[str, tuple[int, int]] = {}
         self._wake_sequence = 0
+        self._perception: dict[str, PerceptionMind] = {}
+        self._disturbances: dict[int, tuple[int, str, str]] = {}
+        self._disturbance_sequence = 0
         for staff in self._minds:
             self._schedule(staff, 0)
+        if scenario.environment is not None:
+            self._setup_environment(scenario.environment, seed, scenario.days)
+
+    def _setup_environment(self, environment: Environment, seed: int, days: int) -> None:
+        curiosity = dict(environment.curiosity)
+        self._perception = {staff: PerceptionMind(curiosity.get(staff, 0)) for staff in self._minds}
+        if environment.nightly_target is None:
+            return
+        rng = Random(seed ^ 0x4D33)
+        for day in range(days):
+            when = day * DAY + rng.randrange(18 * HOUR, 23 * HOUR, MINUTE)
+            self.queue_disturbance(when, environment.nightly_target, "gust")
+
+    def queue_disturbance(self, when: int, target: str, cause: str) -> int:
+        """Queue a simulated physical impulse, for fixture and controlled runs."""
+        if target not in self._world.fitting_positions or not cause:
+            raise ValueError("Disturbance needs a known fitting and a cause")
+        if type(when) is not int or not self.now <= when <= self.horizon:
+            raise ValueError("Disturbance must be within the simulated horizon")
+        self._disturbance_sequence += 1
+        key = self._disturbance_sequence
+        self._disturbances[key] = (when, target, cause)
+        self._clock.schedule(when, partial(self._resolve_disturbance, key))
+        return key
+
+    def cancel_disturbance(self, key: int) -> bool:
+        return self._disturbances.pop(key, None) is not None
+
+    def _resolve_disturbance(self, key: int) -> None:
+        opportunity = self._disturbances.pop(key, None)
+        if opportunity is None:
+            return
+        _, target, cause = opportunity
+        physical = self._world.disturb(target, cause, self.now)
+        if physical is None:
+            return
+        fitting = physical.fitting
+        position = "open" if physical.opened else "closed"
+        self._record("environment", "occurred", "disturbance",
+                     f"cause={physical.cause} target={target} location={fitting.location} position={position}")
+        environment = self._world.environment
+        assert environment is not None
+        distances = sound_distances(fitting.location, environment.acoustic)
+        for staff in self._perception:
+            location = self._world.perceptual_location(staff)
+            if location is not None:
+                self._remember(staff, project(physical, environment, location, distances,
+                                              focused=self._world.is_focused(staff)))
+
+    def _remember(self, staff: str, cues: tuple[Evidence, ...]) -> None:
+        self._perception[staff].remember(cues)
+        for cue in cues:
+            details = [cue.detail]
+            if cue.area is not None:
+                details.append(f"area={cue.area}")
+            if cue.label is not None:
+                details.append(f"object={cue.label}")
+            self._record(staff, "perceived", cue.modality, " ".join(details))
 
     @property
     def now(self) -> int:
@@ -164,6 +234,10 @@ class Simulation:
         if self._social:
             state["social"] = {staff: asdict(mind) for staff, mind in self._social.items()}
             state["encounters"] = {key: asdict(value) for key, value in self._encounters.items()}
+        if self._perception:
+            state["perception"] = {staff: asdict(mind) for staff, mind in self._perception.items()}
+            state["fitting_positions"] = dict(self._world.fitting_positions)
+            state["disturbances"] = dict(self._disturbances)
         return state
 
     def propose_social(self, staff: str, exchange: Exchange) -> bool:
@@ -352,6 +426,12 @@ class Simulation:
             detail = self._world.finish(staff)
             if kind != "move":
                 mind.satisfy(kind)
+            if kind == "inspect":
+                environment = self._world.environment
+                assert environment is not None
+                cues = inspect(environment, self._world.locations[staff], self.now)
+                self._remember(staff, cues)
+                detail = "local condition observed" if cues else "inconclusive"
             self._record(staff, "completed", kind, detail)
             if kind == "prepare" and staff in self._social:
                 for promise in self._social[staff].help:
@@ -441,13 +521,20 @@ class Simulation:
 
         help_intent = social.intent(mind, location, self.now) if social is not None else None
         seek_company = social is not None and social.seeks_company(self.now)
-        decision = mind.choose_camp(location, self.now, self._world.paths, help_intent, seek_company)
+        perception = self._perception.get(staff)
+        inspection = perception.candidate(self.now) if perception is not None else None
+        decision = mind.choose_camp(location, self.now, self._world.paths, help_intent, seek_company, inspection)
+        if perception is not None and mind.travel_goal and mind.travel_goal.startswith("investigate:"):
+            if decision is None or decision[0] != mind.travel_goal:
+                perception.pending = None
         if social is not None and (decision is None or decision[0] == "leisure"):
             if self._consider_social(staff, mind, social):
                 return
         if decision is not None:
             goal, request = decision
             if self._start(staff, request, goal):
+                if perception is not None and request.kind == "inspect":
+                    perception.pending = None
                 return
         mind.travel_goal = None
         self._schedule(staff, min(self.now + REASSESS, self.horizon))
