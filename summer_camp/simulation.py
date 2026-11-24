@@ -284,6 +284,8 @@ class Simulation:
                 return
             commitment = self._world.interrupt_work(staff, self.now)
             mind.preparations[commitment.target] = commitment
+            # The worker is still present and can see the slot they just released.
+            mind.memory.update(self._world.observe(staff, self.now))
             self._record(staff, "interrupted", kind,
                          f"target={commitment.target}, {reason}, {commitment.remaining}s remaining")
 

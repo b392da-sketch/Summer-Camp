@@ -118,7 +118,7 @@ class World:
 
 
     def observe(self, staff: str, now: int) -> dict[str, Observation]:
-        if staff in self.active and self.active[staff].request.kind == "move":
+        if staff in self.active and self.active[staff].request.kind in ("move", "sleep"):
             return {}
         observations = {
             kind: Observation(

@@ -95,6 +95,40 @@ class CampLifeTests(unittest.TestCase):
         self.assertFalse(run.submit("Alex", Request("prepare", target="batch")))
         self.assertEqual(len(actions(run, "completed", "prepare")), 1)
 
+    def test_released_boathouse_slot_is_remembered_until_return_observation(self):
+        alex = worker(location="boathouse", duty=("boathouse",), skills=("repair",),
+                      needs=(81, 0, 0, 0))
+        sam = worker("Sam", "boathouse", skills=("repair",), preferences=(0, 0, -100, 0))
+        rack = Job("rack", "repair", "boathouse", 100 * MINUTE, "repair")
+        free = camp(alex, sam, jobs=(rack,), servings=1)
+        occupied = camp(alex, sam, jobs=(rack,), servings=1)
+        for run in (free, occupied):
+            self.assertTrue(run.submit("Alex", Request("prepare", target="rack")))
+            run.advance(20 * MINUTE)
+            interruption, = actions(run, "interrupted", "prepare")
+            self.assertEqual(interruption.at, 15 * MINUTE)
+        self.assertTrue(occupied.submit("Sam", Request("prepare", target="rack")))
+
+        before_return = 80 * MINUTE - 1
+        memories = []
+        for run in (free, occupied):
+            run.advance(before_return - run.now)
+            memory = run.snapshot()["minds"]["Alex"]["memory"]["prepare:boathouse"]
+            memories.append(memory)
+            self.assertEqual(memory["at"], 15 * MINUTE)
+            self.assertTrue(memory["jobs"][0]["available"])
+            self.assertEqual(run.snapshot()["active"]["Alex"]["request"]["destination"], "boathouse")
+        self.assertEqual(*memories)
+
+        for run in (free, occupied):
+            run.advance(1)
+        resumption, = actions(free, "resumed", "prepare")
+        self.assertEqual(resumption.at, 80 * MINUTE)
+        self.assertEqual(free.snapshot()["active"]["Alex"]["ends_at"], 165 * MINUTE)
+        self.assertEqual(actions(occupied, "resumed", "prepare"), [])
+        self.assertFalse(occupied.submit("Alex", Request("prepare", target="rack")))
+        self.assertEqual(occupied.history[-1].detail, "equipment occupied")
+
     def test_peer_can_complete_interrupted_batch_and_invalidate_commitment(self):
         alex = worker(location="kitchen", skills=("cook",), needs=(81, 0, 0, 0))
         sam = worker("Sam", "kitchen", skills=("cook",), preferences=(0, 0, -100, 0))
@@ -163,6 +197,30 @@ class CampLifeTests(unittest.TestCase):
             self.assertEqual(actions(early, "completed", "sleep"), [])
         early.advance(4 * HOUR)
         self.assertEqual(len(actions(early, "completed", "sleep")), 1)
+
+    def test_sleeping_staff_observes_peer_completion_only_on_waking(self):
+        sleeper = worker(location="cabins", needs=(0, 60, 0, 0), bedtime=0)
+        peer = worker("Sam", "cabins", skills=("cabins",), preferences=(0, 0, -100, 0))
+        cabin = Job("north cabin", "cabin", "cabins", HOUR, "cabins")
+        run = camp(sleeper, peer, jobs=(cabin,))
+        run.advance(0)
+        self.assertEqual(len(actions(run, "started", "sleep")), 1)
+        before_sleep = run.snapshot()["minds"]["Alex"]["memory"]
+        self.assertFalse(before_sleep["prepare:cabins"]["jobs"][0]["done"])
+        self.assertTrue(run.submit("Sam", Request("prepare", target="north cabin")))
+
+        run.advance(2 * HOUR)
+        state = run.snapshot()
+        self.assertEqual(state["job_states"]["north cabin"], "ready")
+        self.assertEqual(state["minds"]["Alex"]["needs"]["rest"], 36 * HOUR)
+        self.assertEqual(state["minds"]["Alex"]["memory"], before_sleep)
+
+        run.advance(6 * HOUR)
+        woke, = actions(run, "completed", "sleep")
+        self.assertEqual(woke.at, 8 * HOUR)
+        observed = run.snapshot()["minds"]["Alex"]["memory"]["prepare:cabins"]
+        self.assertEqual(observed["at"], woke.at)
+        self.assertTrue(observed["jobs"][0]["done"])
 
     def test_empty_kitchen_does_not_cause_rapid_return_trips(self):
         alex = worker(duty=("kitchen",), skills=("cook",), needs=(90, 0, 0, 60))
