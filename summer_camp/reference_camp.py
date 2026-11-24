@@ -3,6 +3,7 @@
 from dataclasses import replace
 
 from .cognition import HOUR, Staff, StaffProfile
+from .perception import Environment, Fitting, Link
 from .simulation import CampLayout, Scenario
 from .social import SocialProfile
 from .world import MINUTE, Job
@@ -53,3 +54,29 @@ def social_camp(days: int = 4) -> Scenario:
         for index, (staff, (company, helpfulness)) in enumerate(zip(camp.staff, temperaments))
     )
     return replace(camp, social=profiles)
+
+
+def perception_camp(days: int = 4) -> Scenario:
+    camp = social_camp(days)
+    paths = {
+        **PATHS,
+        "commons": ("cabins", "kitchen", "workshop", "shore path", "woodland"),
+        "boathouse": ("shore path",),
+        "shore path": ("commons", "boathouse"),
+        "woodland": ("commons",),
+    }
+    assert camp.camp is not None
+    layout = replace(camp.camp, paths=paths)
+    environment = Environment(
+        fittings=(Fitting("shelter shutter", "shutter", "commons"),),
+        acoustic=(
+            Link("commons", "kitchen", 3), Link("commons", "workshop", 5),
+            Link("commons", "cabins", 7), Link("commons", "woodland", 6),
+            Link("commons", "boathouse", 4), Link("boathouse", "shore path", 2),
+        ),
+        sightlines=(Link("commons", "shore path", 1),),
+        lamps=(("commons", 3),),
+        curiosity=(("Avery", 22), ("Morgan", 19), ("Cameron", 21), ("Jordan", 14)),
+        nightly_target="shelter shutter",
+    )
+    return replace(camp, camp=layout, environment=environment)

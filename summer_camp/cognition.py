@@ -175,6 +175,7 @@ class Mind:
         self, location: str, now: int, paths: Mapping[str, tuple[str, ...]],
         help_intent: tuple[str, Request] | None = None,
         seek_company: bool = False,
+        inspection: tuple[str, int] | None = None,
     ) -> tuple[str, Request] | None:
         profile = self.profile
         assert profile is not None
@@ -204,6 +205,10 @@ class Mind:
         if points["leisure"] >= 25 and self.camp_available("leisure", now, location):
             offer(18 + points["leisure"] // 2 + self.preferences["leisure"],
                   "leisure", "commons", Request("leisure"))
+
+        if inspection is not None:
+            destination, score = inspection
+            offer(score, f"investigate:{destination}", destination, Request("inspect"))
 
         if seek_company and location != "commons":
             offer(26, "company", "commons", Request("leisure"))

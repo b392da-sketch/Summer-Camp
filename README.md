@@ -49,3 +49,12 @@ python3 -m summer_camp --scenario m2 --seed 42 --summary-only
 ```
 
 M2 is opt-in and defaults to four days. See the [architecture, metrics, and causal trace](docs/m2-social-life.md).
+
+## M3 environmental perception fixture
+
+```sh
+python3 -m summer_camp --scenario m3 --seed 42
+python3 -m summer_camp --scenario m3 --seed 0 --summary-only
+```
+
+M3 is opt-in and defaults to four days. See the [architecture, metrics, and annotated nighttime traces](docs/m3-perception.md).

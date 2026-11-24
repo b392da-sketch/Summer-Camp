@@ -4,6 +4,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
+from .perception import INSPECTION_TIME, Environment, PhysicalEvent
+
 MINUTE = 60
 
 # The layout is posted at the camp. Live occupancy and supplies are private
@@ -97,6 +99,7 @@ class World:
         *, paths: Mapping[str, tuple[str, ...]] = PATHS, jobs: tuple[Job, ...] = (),
         ingredients: int = 0, capabilities: Mapping[str, tuple[str, ...]] | None = None,
         sleep_durations: Mapping[str, int] | None = None,
+        environment: Environment | None = None,
     ):
         self.locations = dict(starting_locations)
         self.servings = servings
@@ -108,6 +111,8 @@ class World:
         self.ingredients = ingredients
         self.capabilities = capabilities or {}
         self.sleep_durations = sleep_durations or {}
+        self.environment = environment
+        self.fitting_positions = {item.key: False for item in environment.fittings} if environment else {}
         self.activities = ACTIVITIES
         if sleep_durations is not None:
             self.activities = {
@@ -116,6 +121,26 @@ class World:
                 "leisure": Activity("commons", 55 * MINUTE, len(starting_locations)),
             }
 
+
+    def disturb(self, target: str, cause: str, now: int) -> PhysicalEvent | None:
+        if self.environment is None:
+            return None
+        for item in self.environment.fittings:
+            if item.key == target and item.loose:
+                opened = not self.fitting_positions[target]
+                self.fitting_positions[target] = opened
+                return PhysicalEvent(now, item, cause, opened)
+        return None
+
+    def perceptual_location(self, staff: str) -> str | None:
+        action = self.active.get(staff)
+        if action is not None and action.request.kind in ("move", "sleep"):
+            return None
+        return self.locations[staff]
+
+    def is_focused(self, staff: str) -> bool:
+        action = self.active.get(staff)
+        return action is not None and action.request.kind in ("prepare", "social")
 
     def social_peers(self, staff: str, now: int) -> tuple[str, ...]:
         if not self._social_available(staff, now):
@@ -203,6 +228,10 @@ class World:
             if request.destination not in self.paths[location]:
                 raise ValueError("destination is not adjacent")
             duration = 10 * MINUTE
+        elif kind == "inspect" and self.environment is not None:
+            if request.destination is not None:
+                raise ValueError("Inspection must be local")
+            duration = INSPECTION_TIME
         elif kind == "prepare":
             if request.destination is not None:
                 raise ValueError("malformed preparation request")
