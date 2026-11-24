@@ -156,6 +156,7 @@ def inspect(environment: Environment, location: str, now: int) -> tuple[Evidence
 
 @dataclass(frozen=True)
 class Interpretation:
+    reference: int
     evidence: Evidence
     possibility: str
 
@@ -165,6 +166,12 @@ class PerceptionMind:
     curiosity: int
     memory: list[Interpretation] = field(default_factory=list)
     pending: Evidence | None = None
+    pending_reference: int | None = None
+    sequence: int = 0
+
+    def clear_pending(self) -> None:
+        self.pending = None
+        self.pending_reference = None
 
     def remember(self, cues: tuple[Evidence, ...]) -> None:
         for cue in cues:
@@ -174,19 +181,22 @@ class PerceptionMind:
                 guess = "something moved"
             else:
                 guess = "something may have shifted" if cue.detail == "clatter" else "unexplained noise"
-            self.memory.append(Interpretation(cue, guess))
+            self.sequence += 1
+            self.memory.append(Interpretation(self.sequence, cue, guess))
         del self.memory[:-MEMORY_SIZE]
         if self.pending is not None:
             if not cues or cues[0].at - self.pending.at < CUE_LIFETIME:
                 return
-            self.pending = None
-        actionable = next((cue for cue in cues if cue.area is not None and cue.modality != "inspection"), None)
-        if actionable is not None:
-            self.pending = actionable
+            self.clear_pending()
+        for index, cue in enumerate(cues):
+            if cue.area is not None and cue.modality != "inspection":
+                self.pending = cue
+                self.pending_reference = self.sequence - len(cues) + index + 1
+                break
 
     def candidate(self, now: int) -> tuple[str, int] | None:
         if self.pending is not None and now - self.pending.at >= CUE_LIFETIME:
-            self.pending = None
+            self.clear_pending()
         if self.pending is not None and self.pending.area is not None and self.curiosity > 0:
             return self.pending.area, 34 + self.curiosity
         return None

@@ -58,3 +58,12 @@ python3 -m summer_camp --scenario m3 --seed 0 --summary-only
 ```
 
 M3 is opt-in and defaults to four days. See the [architecture, metrics, and annotated nighttime traces](docs/m3-perception.md).
+
+## M4 witness reports fixture
+
+```sh
+python3 -m summer_camp --scenario m4 --seed 42
+python3 -m summer_camp --scenario m4 --seed 42 --summary-only
+```
+
+M4 is opt-in and defaults to four days. See the [architecture, metrics, and causal traces](docs/m4-witness-reports.md).
