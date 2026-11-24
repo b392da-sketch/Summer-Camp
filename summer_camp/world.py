@@ -4,7 +4,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
-from .perception import INSPECTION_TIME, Environment, PhysicalEvent
+from .ecology import Ecology, EcologyState
+from .perception import INSPECTION_TIME, Environment, Evidence, PhysicalEvent, inspect
 
 MINUTE = 60
 
@@ -49,17 +50,20 @@ class Job:
     capability: str
     ingredients: int = 0
     produces: int = 0
+    fitting: str | None = None
 
     def __post_init__(self):
         if not self.target or not self.capability or type(self.duration) is not int or self.duration <= 0:
             raise ValueError("A job needs an identity, a capability and a positive duration")
+        if (self.category == "secure") != bool(self.fitting):
+            raise ValueError("Only securing jobs require a fitting")
         if self.category == "cook":
             if self.location != "kitchen":
                 raise ValueError("Cooking jobs belong in the kitchen")
             if any(type(quantity) is not int or quantity <= 0
                    for quantity in (self.ingredients, self.produces)):
                 raise ValueError("Cooking needs positive ingredient and serving quantities")
-        elif self.category not in ("repair", "cabin") or self.ingredients or self.produces:
+        elif self.category not in ("repair", "cabin", "secure") or self.ingredients or self.produces:
             raise ValueError("Invalid preparation job")
 
 
@@ -100,6 +104,7 @@ class World:
         ingredients: int = 0, capabilities: Mapping[str, tuple[str, ...]] | None = None,
         sleep_durations: Mapping[str, int] | None = None,
         environment: Environment | None = None,
+        ecology: Ecology | None = None,
     ):
         self.locations = dict(starting_locations)
         self.servings = servings
@@ -113,6 +118,8 @@ class World:
         self.sleep_durations = sleep_durations or {}
         self.environment = environment
         self.fitting_positions = {item.key: False for item in environment.fittings} if environment else {}
+        self.fitting_security = {item.key: not item.loose for item in environment.fittings} if environment else {}
+        self.ecology = EcologyState(ecology) if ecology is not None else None
         self.activities = ACTIVITIES
         if sleep_durations is not None:
             self.activities = {
@@ -126,11 +133,25 @@ class World:
         if self.environment is None:
             return None
         for item in self.environment.fittings:
-            if item.key == target and item.loose:
+            if item.key == target and not self.fitting_security[target]:
                 opened = not self.fitting_positions[target]
                 self.fitting_positions[target] = opened
                 return PhysicalEvent(now, item, cause, opened)
         return None
+
+    def inspect(self, location: str, now: int) -> tuple[Evidence, ...]:
+        environment = self.environment
+        assert environment is not None
+        findings = inspect(environment, location, now, self.fitting_security)
+        if self.ecology is None or environment.light(location, now) + 1 < 3:
+            return findings
+        ecology = self.ecology
+        if location == ecology.config.refuse:
+            condition = "tipped container" if ecology.tipped else "upright container"
+            findings += (Evidence(now, "inspection", condition, location, "refuse container"),)
+        if ecology.wetness.get(location, 0):
+            findings += (Evidence(now, "inspection", "wet ground", location, "ground"),)
+        return findings
 
     def perceptual_location(self, staff: str) -> str | None:
         action = self.active.get(staff)
@@ -192,7 +213,8 @@ class World:
                     JobOffer(job.target, job.category, job.capability,
                              self.job_states[job.target] != "pending",
                              free and self.job_states[job.target] == "pending"
-                             and job.ingredients <= ingredients)
+                             and job.ingredients <= ingredients
+                             and not self.fitting_security.get(job.fitting, False))
                     for job in self.jobs.values() if job.location == location
                 ),
             )
@@ -236,7 +258,8 @@ class World:
             if request.destination is not None:
                 raise ValueError("malformed preparation request")
             job = self.jobs.get(request.target)
-            if job is None or self.job_states[job.target] != "pending":
+            if (job is None or self.job_states[job.target] != "pending"
+                    or self.fitting_security.get(job.fitting, False)):
                 raise ValueError("job unavailable")
             if location != job.location:
                 raise ValueError("wrong location")
@@ -285,7 +308,11 @@ class World:
             assert self.job_states[job.target] == "pending" and self.ingredients >= job.ingredients
             self.ingredients -= job.ingredients
             self.servings += job.produces
-            outcome = {"cook": "cooked", "repair": "repaired", "cabin": "ready"}[job.category]
+            outcome = {"cook": "cooked", "repair": "repaired", "cabin": "ready", "secure": "secured"}[job.category]
+            if job.fitting is not None:
+                self.fitting_security[job.fitting] = True
+            if self.ecology is not None and job.category == "cook":
+                self.ecology.add_scraps()
             self.job_states[job.target] = outcome
             detail = f"target={job.target} pending -> {outcome}"
             if job.produces:

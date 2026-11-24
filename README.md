@@ -67,3 +67,12 @@ python3 -m summer_camp --scenario m4 --seed 42 --summary-only
 ```
 
 M4 is opt-in and defaults to four days. See the [architecture, metrics, and causal traces](docs/m4-witness-reports.md).
+
+## M5 ecology fixture
+
+```sh
+python3 -m summer_camp --scenario m5 --seed 0
+python3 -m summer_camp --scenario m5 --seed 42 --summary-only
+```
+
+M5 is opt-in and defaults to four days. See the [architecture, metrics, and controlled causal trace](docs/m5-ecology.md).

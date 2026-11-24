@@ -8,8 +8,9 @@ from types import MappingProxyType
 
 from .clock import DAY, Clock
 from .cognition import CAMP_DESTINATIONS, REASSESS, Mind, Staff, route
+from .ecology import ANIMAL_INTERVAL, WEATHER_INTERVAL, Ecology, Incident, Transit
 from .perception import (
-    HOUR, MINUTE, Environment, Evidence, PerceptionMind, inspect, project, sound_distances,
+    HOUR, MINUTE, Environment, Evidence, PerceptionMind, project, sound_distances,
 )
 from .social import (
     COOLDOWN, DURATION, PROMISE_WINDOW, Claim, Encounter, Exchange,
@@ -56,6 +57,7 @@ class Scenario:
     social: tuple[tuple[str, SocialProfile], ...] = ()
     environment: Environment | None = None
     witness_reports: bool = False
+    ecology: Ecology | None = None
 
     def __post_init__(self):
         if type(self.days) is not int or not 1 <= self.days <= MAX_DAYS:
@@ -93,6 +95,19 @@ class Scenario:
             if self.camp is None:
                 raise ValueError("Environmental perception requires a camp layout")
             self.environment.validate(paths, names)
+        fittings = {item.key: item for item in self.environment.fittings} if self.environment else {}
+        securing = [job for job in self.camp.jobs if job.fitting is not None] if self.camp else []
+        if (len({job.fitting for job in securing}) != len(securing)
+                or any(job.fitting not in fittings or fittings[job.fitting].location != job.location
+                       for job in securing)):
+            raise ValueError("Securing jobs need distinct fittings at their location")
+        if self.ecology is not None:
+            if self.environment is None or self.environment.nightly_target is not None:
+                raise ValueError("Ecology requires perception without nightly disturbance scheduling")
+            self.ecology.validate(paths)
+            target = fittings.get(self.ecology.gust_target)
+            if target is None or target.location not in self.ecology.exposed:
+                raise ValueError("The gust fitting must be outdoors")
 
 
 @dataclass(frozen=True)
@@ -123,6 +138,7 @@ class Simulation:
             sleep_durations={staff.name: staff.profile.sleep_duration for staff in scenario.staff
                              if staff.profile is not None} if camp is not None else None,
             environment=scenario.environment,
+            ecology=scenario.ecology,
         )
         self._social = {name: SocialMind.create(profile) for name, profile in scenario.social}
         self._encounters: dict[int, Encounter] = {}
@@ -138,6 +154,10 @@ class Simulation:
             self._schedule(staff, 0)
         if scenario.environment is not None:
             self._setup_environment(scenario.environment, seed, scenario.days)
+        if scenario.ecology is not None:
+            self._weather_rng = Random(seed ^ 0x4D35)
+            self._clock.schedule(WEATHER_INTERVAL, self._weather_update)
+            self._clock.schedule(ANIMAL_INTERVAL, self._animal_decision)
 
     def _setup_environment(self, environment: Environment, seed: int, days: int) -> None:
         curiosity = dict(environment.curiosity)
@@ -169,21 +189,80 @@ class Simulation:
         if opportunity is None:
             return
         _, target, cause = opportunity
+        self._disturb_fitting(target, cause)
+
+    def _disturb_fitting(self, target: str, cause: str) -> None:
         physical = self._world.disturb(target, cause, self.now)
         if physical is None:
             return
-        fitting = physical.fitting
         position = "open" if physical.opened else "closed"
+        self._emit_incident(Incident(physical.cause, target, position, physical.stimulus))
+
+    def _emit_incident(self, incident: Incident) -> None:
+        stimulus = incident.stimulus
         self._record("environment", "occurred", "disturbance",
-                     f"cause={physical.cause} target={target} location={fitting.location} position={position}")
+                     f"cause={incident.cause} target={incident.target} "
+                     f"location={stimulus.location} position={incident.condition}")
         environment = self._world.environment
         assert environment is not None
-        distances = sound_distances(fitting.location, environment.acoustic)
+        distances = sound_distances(stimulus.location, environment.acoustic)
         for staff in self._perception:
             location = self._world.perceptual_location(staff)
             if location is not None:
-                self._remember(staff, project(physical, environment, location, distances,
+                self._remember(staff, project(stimulus, environment, location, distances,
                                               focused=self._world.is_focused(staff)))
+
+    def _weather_update(self) -> None:
+        ecology = self._world.ecology
+        assert ecology is not None
+        gust = ecology.update_weather(self._weather_rng, final=self.now == self.horizon)
+        rain = "raining" if ecology.raining else "dry"
+        self._record("environment", "updated", "weather",
+                     f"wind={ecology.wind} rain={rain} wetness={ecology.wetness}")
+        if gust:
+            self._disturb_fitting(ecology.config.gust_target, "gust")
+        when = self.now + WEATHER_INTERVAL
+        if when <= self.horizon:
+            self._clock.schedule(when, self._weather_update)
+
+    def _animal_decision(self) -> None:
+        ecology = self._world.ecology
+        assert ecology is not None
+        transit = ecology.decide(self.now, self.horizon)
+        self._record("raccoon", "decided", "wildlife",
+                     f"activity={ecology.raccoon.activity} hunger={ecology.raccoon.hunger}")
+        if transit is not None:
+            self._record("raccoon", "started", "wildlife travel",
+                         f"from={transit.origin} to={transit.destination} arrival={transit.arrival}")
+            self._clock.schedule(transit.arrival, partial(self._animal_arrival, transit))
+        else:
+            if ecology.raccoon.activity == "foraging":
+                self._animal_forage()
+            self._schedule_animal_decision()
+
+    def _animal_arrival(self, transit: Transit) -> None:
+        ecology = self._world.ecology
+        assert ecology is not None
+        if not ecology.arrive(transit, self.now):
+            return
+        self._record("raccoon", "completed", "wildlife travel", transit.destination)
+        self._animal_forage()
+        self._schedule_animal_decision()
+
+    def _animal_forage(self) -> None:
+        ecology = self._world.ecology
+        assert ecology is not None
+        scraps = ecology.scraps
+        incident = ecology.forage(self.now)
+        if ecology.scraps < scraps:
+            self._record("raccoon", "completed", "forage", f"scraps={ecology.scraps}")
+        if incident is not None:
+            self._emit_incident(incident)
+
+    def _schedule_animal_decision(self) -> None:
+        when = self.now + ANIMAL_INTERVAL
+        if when < self.horizon:
+            self._clock.schedule(when, self._animal_decision)
 
     def _remember(self, staff: str, cues: tuple[Evidence, ...]) -> None:
         self._perception[staff].remember(cues)
@@ -247,6 +326,10 @@ class Simulation:
             state["disturbances"] = dict(self._disturbances)
         if self._testimony:
             state["testimony"] = {staff: asdict(mind) for staff, mind in self._testimony.items()}
+        if self._world.ecology is not None:
+            state["ecology"] = asdict(self._world.ecology)
+        if self._perception:
+            state["fitting_security"] = dict(self._world.fitting_security)
         return state
 
     def _testimony_payload(self, staff: str, exchange: Exchange) -> Payload | None:
@@ -481,9 +564,7 @@ class Simulation:
             if kind != "move":
                 mind.satisfy(kind)
             if kind == "inspect":
-                environment = self._world.environment
-                assert environment is not None
-                cues = inspect(environment, self._world.locations[staff], self.now)
+                cues = self._world.inspect(self._world.locations[staff], self.now)
                 self._remember(staff, cues)
                 detail = "local condition observed" if cues else "inconclusive"
             self._record(staff, "completed", kind, detail)

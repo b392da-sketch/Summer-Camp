@@ -3,6 +3,7 @@
 from dataclasses import replace
 
 from .cognition import HOUR, Staff, StaffProfile
+from .ecology import Ecology, Trail
 from .perception import Environment, Fitting, Link
 from .simulation import CampLayout, Scenario
 from .social import SocialProfile
@@ -87,3 +88,21 @@ def witness_camp(days: int = 4) -> Scenario:
     profiles = tuple((name, replace(profile, company=1) if name == "Taylor" else profile)
                      for name, profile in camp.social)
     return replace(camp, social=profiles, witness_reports=True)
+
+def ecology_camp(days: int = 4) -> Scenario:
+    camp = witness_camp(days)
+    assert camp.camp is not None and camp.environment is not None
+    paths = {**camp.camp.paths, "kitchen": ("commons", "service yard"),
+             "service yard": ("kitchen", "woodland"), "woodland": ("commons", "service yard")}
+    fitting = camp.environment.fittings[0]
+    job = Job("secure shelter shutter", "secure", fitting.location, 45 * MINUTE,
+              "repair", fitting=fitting.key)
+    layout = replace(camp.camp, paths=paths, jobs=(*camp.camp.jobs, job))
+    environment = replace(
+        camp.environment, nightly_target=None,
+        acoustic=(*camp.environment.acoustic, Link("kitchen", "service yard", 2)),
+        lamps=(*camp.environment.lamps, ("service yard", 2)),
+    )
+    ecology = Ecology(("commons", "woodland", "shore path", "service yard"), fitting.key,
+                      "woodland", "service yard", (Trail("woodland", "service yard"),))
+    return replace(camp, camp=layout, environment=environment, ecology=ecology)
