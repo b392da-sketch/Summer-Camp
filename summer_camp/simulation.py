@@ -15,6 +15,7 @@ from .social import (
     COOLDOWN, DURATION, PROMISE_WINDOW, Claim, Encounter, Exchange,
     Help, Relationship, SocialMind, SocialProfile, bound, observed_job,
 )
+from .testimony import REPORT_WINDOW, Payload, Testimony, TestimonyMind
 from .world import PATHS, Action, Job, Observation, Request, World
 
 MAX_DAYS = 7
@@ -54,6 +55,7 @@ class Scenario:
     camp: CampLayout | None = None
     social: tuple[tuple[str, SocialProfile], ...] = ()
     environment: Environment | None = None
+    witness_reports: bool = False
 
     def __post_init__(self):
         if type(self.days) is not int or not 1 <= self.days <= MAX_DAYS:
@@ -85,6 +87,8 @@ class Scenario:
                 raise ValueError("Responsibilities must use known facilities")
         if any(staff.location not in paths for staff in self.staff):
             raise ValueError("Staff must start at a camp location")
+        if self.witness_reports and (self.environment is None or not self.social):
+            raise ValueError("Witness reports require perception and social profiles")
         if self.environment is not None:
             if self.camp is None:
                 raise ValueError("Environmental perception requires a camp layout")
@@ -127,6 +131,7 @@ class Simulation:
         self._wakes: dict[str, tuple[int, int]] = {}
         self._wake_sequence = 0
         self._perception: dict[str, PerceptionMind] = {}
+        self._testimony = {staff: TestimonyMind() for staff in self._social} if scenario.witness_reports else {}
         self._disturbances: dict[int, tuple[int, str, str]] = {}
         self._disturbance_sequence = 0
         for staff in self._minds:
@@ -182,6 +187,8 @@ class Simulation:
 
     def _remember(self, staff: str, cues: tuple[Evidence, ...]) -> None:
         self._perception[staff].remember(cues)
+        if staff in self._testimony:
+            self._testimony[staff].compare(cues)
         for cue in cues:
             details = [cue.detail]
             if cue.area is not None:
@@ -238,7 +245,27 @@ class Simulation:
             state["perception"] = {staff: asdict(mind) for staff, mind in self._perception.items()}
             state["fitting_positions"] = dict(self._world.fitting_positions)
             state["disturbances"] = dict(self._disturbances)
+        if self._testimony:
+            state["testimony"] = {staff: asdict(mind) for staff, mind in self._testimony.items()}
         return state
+
+    def _testimony_payload(self, staff: str, exchange: Exchange) -> Payload | None:
+        state = self._testimony.get(staff)
+        if (state is None or exchange.peer not in self._testimony or exchange.location is not None
+                or exchange.target is not None or type(exchange.reference) is not int):
+            return None
+        ref = exchange.reference
+        if exchange.kind == "testimony" and exchange.witness is None:
+            for memory in self._perception[staff].memory:
+                if memory.reference == ref and self.now + DURATION <= memory.evidence.at + REPORT_WINDOW:
+                    return Payload(Testimony(staff, memory))
+        if exchange.kind == "relay" and exchange.witness not in (None, exchange.peer, staff):
+            received = state.accounts.get((exchange.witness, ref))
+            if received is not None:
+                delivery = received.delivery
+                if not delivery.relayed and self.now + DURATION <= delivery.testimony.cue.at + REPORT_WINDOW:
+                    return Payload(delivery.testimony, delivery.first_report_at, relayed=True)
+        return None
 
     def propose_social(self, staff: str, exchange: Exchange) -> bool:
         """Propose an encounter through the same consent and availability rules as AI."""
@@ -249,7 +276,14 @@ class Simulation:
         if (social is None or other is None or ends > self.horizon
                 or peer not in self._world.social_peers(staff, self.now)):
             return False
-        if exchange.kind == "greet":
+        payload = None
+        if exchange.kind in ("testimony", "relay"):
+            payload = self._testimony_payload(staff, exchange)
+            if payload is None or exchange.topic in social.topics:
+                return False
+        elif exchange.witness is not None or exchange.reference is not None:
+            return False
+        elif exchange.kind == "greet":
             if exchange.location is not None or exchange.target is not None:
                 return False
         elif (exchange.kind not in ("ask", "report", "help") or exchange.location not in self._world.paths
@@ -273,7 +307,7 @@ class Simulation:
         suspended = self._world.reserve_encounter(staff, peer, self.now, ends)
         self._encounter_sequence += 1
         key = self._encounter_sequence
-        self._encounters[key] = Encounter(staff, exchange, ends, suspended)
+        self._encounters[key] = Encounter(staff, exchange, ends, suspended, payload)
         for name in (staff, peer):
             self._wakes.pop(name, None)
         self._record(staff, "started", "social", f"peer={peer} kind={exchange.kind}")
@@ -323,6 +357,8 @@ class Simulation:
                 relation.affinity = bound(relation.affinity + 1)
         if exchange.kind == "greet":
             return detail
+        if encounter.payload is not None:
+            return self._deliver_testimony(staff, peer, encounter.payload, detail)
 
         source, listener = (peer, staff) if exchange.kind == "ask" else (staff, peer)
         evidence = observed_job(self._minds[source], exchange)
@@ -351,6 +387,24 @@ class Simulation:
                 relation.affinity = bound(relation.affinity - 1)
             detail += f" response={response}"
         return detail
+
+    def _deliver_testimony(self, staff: str, peer: str, payload: Payload, detail: str) -> str:
+        report = payload.testimony
+        cue = report.cue
+        if not payload.relayed:
+            sender = self._testimony[staff]
+            sender.first_reports = {
+                ref: timing for ref, timing in sender.first_reports.items() if timing[1] >= self.now
+            }
+            first, _ = sender.first_reports.setdefault(report.observation.reference,
+                                                        (self.now, cue.at + REPORT_WINDOW))
+            payload = Payload(report, first)
+        relation = self._social[peer].relationships[staff]
+        received = self._testimony[peer].receive(payload, staff, self.now,
+                                                 self._perception[peer].curiosity, relation.trust)
+        status = "received" if received else "duplicate"
+        return (f"{detail} witness={report.witness} reference={report.observation.reference}"
+                f" observed={cue.at} cue={cue.detail} area={cue.area or 'unknown'} delivery={status}")
 
     def cancel_preparation(self, staff: str) -> bool:
         """Cancel an active M1 job, releasing reservations and discarding its progress."""
@@ -522,24 +576,70 @@ class Simulation:
         help_intent = social.intent(mind, location, self.now) if social is not None else None
         seek_company = social is not None and social.seeks_company(self.now)
         perception = self._perception.get(staff)
-        inspection = perception.candidate(self.now) if perception is not None else None
+        testimony = self._testimony.get(staff)
+        investigation = None
+        inspection = None
+        if perception is not None:
+            if testimony is None:
+                inspection = perception.candidate(self.now)
+            else:
+                investigation = testimony.candidate(staff, perception, self.now)
+                if investigation is not None:
+                    inspection = (investigation.area, investigation.score)
         decision = mind.choose_camp(location, self.now, self._world.paths, help_intent, seek_company, inspection)
-        if perception is not None and mind.travel_goal and mind.travel_goal.startswith("investigate:"):
+        if testimony is not None and testimony.travelling is not None:
+            if decision is None or decision[0] != f"investigate:{testimony.travelling.area}":
+                testimony.travelling = None
+        elif testimony is None and perception is not None and mind.travel_goal and mind.travel_goal.startswith("investigate:"):
             if decision is None or decision[0] != mind.travel_goal:
-                perception.pending = None
+                perception.clear_pending()
         if social is not None and (decision is None or decision[0] == "leisure"):
             if self._consider_social(staff, mind, social):
                 return
         if decision is not None:
             goal, request = decision
             if self._start(staff, request, goal):
-                if perception is not None and request.kind == "inspect":
-                    perception.pending = None
+                if testimony is not None and investigation is not None and goal == f"investigate:{investigation.area}":
+                    if testimony.travelling is None:
+                        source = "firsthand" if investigation.firsthand else "testimony"
+                        self._record(staff, "selected", "investigation",
+                                     f"source={source} witness={investigation.origin[0]} "
+                                     f"reference={investigation.origin[1]} area={investigation.area}")
+                    assert perception is not None
+                    testimony.depart(investigation, perception, moving=request.kind == "move")
+                elif perception is not None and request.kind == "inspect":
+                    perception.clear_pending()
                 return
         mind.travel_goal = None
         self._schedule(staff, min(self.now + REASSESS, self.horizon))
 
+    def _sensory_proposal(self, staff: str, peer: str) -> Exchange | None:
+        social = self._social[staff]
+        relation = social.relationships.get(peer, Relationship())
+        inclination = social.profile.company + relation.affinity + relation.trust
+        if inclination < 1:
+            return None
+        options: list[tuple[int, Exchange]] = []
+        state = self._testimony[staff]
+        sources = [
+            (Exchange(peer, "relay", witness=witness, reference=ref), account.delivery.testimony.cue)
+            for (witness, ref), account in state.accounts.items()
+            if not account.delivery.relayed and witness != peer and account.assessment == "credible"
+        ]
+        sources.extend((Exchange(peer, "testimony", reference=memory.reference), memory.evidence)
+                       for memory in self._perception[staff].memory)
+        for exchange, cue in sources:
+            age = self.now - cue.at
+            if exchange.topic in social.topics or age + DURATION > REPORT_WINDOW:
+                continue
+            significance = 3 if cue.label is not None or cue.detail == "clatter" else 1
+            score = significance + inclination - age // (4 * HOUR)
+            if score >= 2:
+                options.append((score, exchange))
+        return max(options, key=lambda item: item[0])[1] if options else None
+
     def _consider_social(self, staff: str, mind: Mind, social: SocialMind) -> bool:
         peers = tuple(peer for peer in self._world.social_peers(staff, self.now) if peer in self._social)
-        exchange = social.proposal(mind, peers, self.now)
+        sensory = partial(self._sensory_proposal, staff) if staff in self._testimony else None
+        exchange = social.proposal(mind, peers, self.now, sensory)
         return exchange is not None and self.propose_social(staff, exchange)

@@ -80,3 +80,10 @@ def perception_camp(days: int = 4) -> Scenario:
         nightly_target="shelter shutter",
     )
     return replace(camp, camp=layout, environment=environment)
+
+
+def witness_camp(days: int = 4) -> Scenario:
+    camp = perception_camp(days)
+    profiles = tuple((name, replace(profile, company=1) if name == "Taylor" else profile)
+                     for name, profile in camp.social)
+    return replace(camp, social=profiles, witness_reports=True)

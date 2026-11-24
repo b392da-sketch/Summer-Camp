@@ -1,8 +1,10 @@
 """Private social beliefs and short, structured exchanges."""
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from .testimony import Payload
 from .world import MINUTE, JobOffer, Request
 
 if TYPE_CHECKING:
@@ -28,9 +30,13 @@ class Exchange:
     kind: str = "greet"
     location: str | None = None
     target: str | None = None
+    witness: str | None = None
+    reference: int | None = None
 
     @property
     def topic(self) -> tuple:
+        if self.kind in ("testimony", "relay"):
+            return (self.peer, self.kind, self.witness, self.reference)
         return (self.peer, self.kind, self.location, self.target)
 
 
@@ -64,6 +70,7 @@ class Encounter:
     exchange: Exchange
     ends: int
     leisure_remaining: tuple[int, int]
+    payload: Payload | None = None
 
     @property
     def participants(self) -> tuple[str, str]:
@@ -99,7 +106,10 @@ class SocialMind:
     def seeks_company(self, now: int) -> bool:
         return self.profile.company > 0 and now - self.last_exchange >= SOCIAL_REST
 
-    def proposal(self, mind: "Mind", peers: tuple[str, ...], now: int) -> Exchange | None:
+    def proposal(
+        self, mind: "Mind", peers: tuple[str, ...], now: int,
+        sensory_proposal: Callable[[str], Exchange | None] | None = None,
+    ) -> Exchange | None:
         if self.profile.company < 0 or now - self.last_exchange < SOCIAL_REST:
             return None
         for peer in peers:
@@ -114,6 +124,10 @@ class SocialMind:
                     if (not job.done and job.capability not in mind.profile.capabilities
                             and request.topic not in self.topics):
                         return request
+            if sensory_proposal is not None:
+                proposal = sensory_proposal(peer)
+                if proposal is not None:
+                    return proposal
             return Exchange(peer)
         return None
 
