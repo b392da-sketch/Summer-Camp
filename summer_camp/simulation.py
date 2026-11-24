@@ -9,6 +9,7 @@ from types import MappingProxyType
 from .clock import DAY, Clock
 from .cognition import CAMP_DESTINATIONS, REASSESS, Mind, Staff, route
 from .ecology import ANIMAL_INTERVAL, WEATHER_INTERVAL, Ecology, Incident, Transit
+from .maintenance import Crossing, EnvironmentalMind, Maintenance, ObsoleteRighting
 from .perception import (
     HOUR, MINUTE, Environment, Evidence, PerceptionMind, project, sound_distances,
 )
@@ -17,7 +18,7 @@ from .social import (
     Help, Relationship, SocialMind, SocialProfile, bound, observed_job,
 )
 from .testimony import REPORT_WINDOW, Payload, Testimony, TestimonyMind
-from .world import PATHS, Action, Job, Observation, Request, World
+from .world import PATHS, Action, Job, Observation, Request, RightingAction, RouteAction, World
 
 MAX_DAYS = 7
 DEFAULT_REPAIRS = ("canoe rack", "supply cart", "trail sign")
@@ -58,6 +59,7 @@ class Scenario:
     environment: Environment | None = None
     witness_reports: bool = False
     ecology: Ecology | None = None
+    maintenance: Maintenance | None = None
 
     def __post_init__(self):
         if type(self.days) is not int or not 1 <= self.days <= MAX_DAYS:
@@ -109,6 +111,15 @@ class Scenario:
             if target is None or target.location not in self.ecology.exposed:
                 raise ValueError("The gust fitting must be outdoors")
 
+        if self.maintenance is not None:
+            if self.ecology is None:
+                raise ValueError("Maintenance requires an ecology")
+            first, second = self.maintenance.wet_edge
+            node = self.maintenance.exposed_node
+            if (second not in paths.get(first, ()) or node not in (first, second)
+                    or node not in self.ecology.exposed):
+                raise ValueError("Wet route needs an exposed endpoint on a camp path")
+
 
 @dataclass(frozen=True)
 class Event:
@@ -139,10 +150,14 @@ class Simulation:
                              if staff.profile is not None} if camp is not None else None,
             environment=scenario.environment,
             ecology=scenario.ecology,
+            maintenance=scenario.maintenance,
         )
         self._social = {name: SocialMind.create(profile) for name, profile in scenario.social}
         self._encounters: dict[int, Encounter] = {}
         self._encounter_sequence = 0
+        self._environmental = (
+            {staff: EnvironmentalMind() for staff in self._minds} if scenario.maintenance is not None else {}
+        )
         self._history: list[Event] = []
         self._wakes: dict[str, tuple[int, int]] = {}
         self._wake_sequence = 0
@@ -330,6 +345,9 @@ class Simulation:
             state["ecology"] = asdict(self._world.ecology)
         if self._perception:
             state["fitting_security"] = dict(self._world.fitting_security)
+        if self._environmental:
+            state["environmental_memory"] = {staff: asdict(mind) for staff, mind in self._environmental.items()}
+            state["righting"] = asdict(self._world.righting) if self._world.righting is not None else None
         return state
 
     def _testimony_payload(self, staff: str, exchange: Exchange) -> Payload | None:
@@ -485,6 +503,14 @@ class Simulation:
         relation = self._social[peer].relationships[staff]
         received = self._testimony[peer].receive(payload, staff, self.now,
                                                  self._perception[peer].curiosity, relation.trust)
+        if received and peer in self._environmental:
+            account = self._testimony[peer].accounts[report.origin]
+            ecology = self._world.ecology
+            assert ecology is not None
+            if (account.assessment == "credible" and cue.modality in ("notice", "inspection")
+                    and cue.detail == "tipped container" and cue.label == "refuse container"
+                    and cue.area == ecology.config.refuse):
+                self._environmental[peer].consider_report(report.witness, report.observation.reference, cue, self.now)
         status = "received" if received else "duplicate"
         return (f"{detail} witness={report.witness} reference={report.observation.reference}"
                 f" observed={cue.at} cue={cue.detail} area={cue.area or 'unknown'} delivery={status}")
@@ -498,6 +524,38 @@ class Simulation:
         self._record(staff, "cancelled", "prepare", f"target={commitment.target}")
         self._schedule(staff, self.now)
         return True
+
+    def cancel_maintenance(self, staff: str) -> bool:
+        if self.now == self.horizon or self._world.suspend_righting(staff, self.now) is None:
+            return False
+        self._record(staff, "cancelled", "right_bin")
+        self._schedule(staff, self.now)
+        return True
+
+    def _check_container(self, staff: str, cue: Evidence) -> bool:
+        memory = self._environmental[staff]
+        changed = memory.notice(cue)
+        if cue.detail == "upright container" and memory.visit is not None:
+            self._record(staff, "abandoned", "maintenance visit", "container observed upright")
+            memory.visit = None
+        if not changed and staff in self._testimony:
+            self._testimony[staff].compare((cue,))
+        return changed
+
+    def _inspection_cues(self, staff: str) -> tuple[tuple[Evidence, ...], bool]:
+        location = self._world.locations[staff]
+        cues = self._world.inspect(location, self.now)
+        if staff not in self._environmental:
+            return cues, bool(cues)
+        ecology = self._world.ecology
+        assert ecology is not None
+        findings = []
+        for cue in cues:
+            if cue.label != "refuse container" or self._check_container(staff, cue):
+                findings.append(cue)
+        if location == ecology.config.refuse:
+            self._environmental[staff].visit = None
+        return tuple(findings), bool(cues)
 
     def _record(self, staff: str, phase: str, action: str, detail: str = "") -> None:
         self._history.append(Event(self.now, staff, phase, action, detail))
@@ -513,9 +571,13 @@ class Simulation:
         commitment = mind.repair_commitment
         if request.kind == "prepare" and request.target is not None:
             commitment = mind.preparations.get(request.target)
+        environmental = self._environmental.get(staff)
+        progress = environmental.progress if environmental is not None and request.kind == "right_bin" else None
         try:
-            action = self._world.start(staff, request, self.now, commitment)
+            action = self._world.start(staff, request, self.now, commitment, progress)
         except ValueError as error:
+            if isinstance(error, ObsoleteRighting) and environmental is not None:
+                environmental.progress = None
             self._record(staff, "failed", request.kind, str(error))
             return False
 
@@ -528,13 +590,22 @@ class Simulation:
                 phase = "resumed"
         elif kind == "move":
             detail = f"to={request.destination} goal={goal or 'external'}"
+            if isinstance(action, RouteAction):
+                detail += f" duration={action.duration}s"
+        elif isinstance(action, RightingAction):
+            detail = f"revision={action.reservation.revision} ticket={action.reservation.ticket}"
+            if progress is not None:
+                phase = "resumed"
+            assert environmental is not None
+            environmental.progress = None
+            environmental.visit = None
         if mind.profile is not None:
             mind.accrue(self.now)
         if kind == "sleep":
             detail = f"duration={action.ends_at - self.now}s"
         self._record(staff, phase, kind, detail)
         mind.travel_goal = goal if kind == "move" else None
-        if phase == "resumed":
+        if phase == "resumed" and kind != "right_bin":
             if kind == "prepare":
                 del mind.preparations[commitment.target]
             else:
@@ -546,7 +617,7 @@ class Simulation:
         return True
 
     def _next_check(self, kind: str, ends_at: int) -> int:
-        if kind in ("prepare", "sleep"):
+        if kind in ("prepare", "sleep", "right_bin"):
             return min(ends_at, self.now + REASSESS, self.horizon)
         return min(ends_at, self.now + REASSESS) if kind == "work" else ends_at
 
@@ -560,14 +631,25 @@ class Simulation:
         mind.accrue(self.now, sleeping=sleeping)
         if action and action.ends_at == self.now:
             kind = action.request.kind
-            detail = self._world.finish(staff)
+            if isinstance(action, RouteAction):
+                origin = self._world.locations[staff]
+                destination = action.request.destination
+                assert destination is not None
+                self._environmental[staff].crossing = Crossing(origin, destination, action.duration, self.now)
+            if isinstance(action, RightingAction):
+                changed = self._world.complete_righting(staff, action, self.now)
+                phase = "completed" if changed else "failed"
+                detail = "tipped -> upright" if changed else "Obsolete righting action"
+            else:
+                detail = self._world.finish(staff)
+                phase = "completed"
             if kind != "move":
                 mind.satisfy(kind)
             if kind == "inspect":
-                cues = self._world.inspect(self._world.locations[staff], self.now)
+                cues, observed = self._inspection_cues(staff)
                 self._remember(staff, cues)
-                detail = "local condition observed" if cues else "inconclusive"
-            self._record(staff, "completed", kind, detail)
+                detail = "local condition observed" if observed else "inconclusive"
+            self._record(staff, phase, kind, detail)
             if kind == "prepare" and staff in self._social:
                 for promise in self._social[staff].help:
                     if promise.claim.target == action.request.target and promise.state == "accepted":
@@ -578,6 +660,10 @@ class Simulation:
                             promise.state = "expired"
             action = None
 
+        if staff in self._environmental:
+            cue = self._world.notice_container(staff, self.now)
+            if cue is not None and self._check_container(staff, cue):
+                self._remember(staff, (cue,))
         observations = self._world.observe(staff, self.now)
         mind.memory.update(observations)
         commitment = mind.repair_commitment
@@ -638,7 +724,7 @@ class Simulation:
             return
         if action is not None:
             kind = action.request.kind
-            reason = mind.camp_break(self.now, location) if kind == "prepare" else None
+            reason = mind.camp_break(self.now, location) if kind in ("prepare", "right_bin") else None
             if reason is None:
                 if social is not None and kind == "leisure":
                     if self._consider_social(staff, mind, social):
@@ -647,12 +733,19 @@ class Simulation:
                 else:
                     self._schedule(staff, self._next_check(kind, action.ends_at))
                 return
-            commitment = self._world.interrupt_work(staff, self.now)
-            mind.preparations[commitment.target] = commitment
+            if kind == "right_bin":
+                progress = self._world.suspend_righting(staff, self.now)
+                assert progress is not None
+                self._environmental[staff].progress = progress
+                self._record(staff, "interrupted", kind,
+                             f"revision={progress.revision}, {reason}, {progress.remaining}s remaining")
+            else:
+                commitment = self._world.interrupt_work(staff, self.now)
+                mind.preparations[commitment.target] = commitment
+                self._record(staff, "interrupted", kind,
+                             f"target={commitment.target}, {reason}, {commitment.remaining}s remaining")
             # The worker is still present and can see the slot they just released.
             mind.memory.update(self._world.observe(staff, self.now))
-            self._record(staff, "interrupted", kind,
-                         f"target={commitment.target}, {reason}, {commitment.remaining}s remaining")
 
         help_intent = social.intent(mind, location, self.now) if social is not None else None
         seek_company = social is not None and social.seeks_company(self.now)
@@ -667,7 +760,8 @@ class Simulation:
                 investigation = testimony.candidate(staff, perception, self.now)
                 if investigation is not None:
                     inspection = (investigation.area, investigation.score)
-        decision = mind.choose_camp(location, self.now, self._world.paths, help_intent, seek_company, inspection)
+        upkeep = self._maintenance_choice(staff, mind, location)
+        decision = mind.choose_camp(location, self.now, self._world.paths, help_intent, seek_company, inspection, upkeep)
         if testimony is not None and testimony.travelling is not None:
             if decision is None or decision[0] != f"investigate:{testimony.travelling.area}":
                 testimony.travelling = None
@@ -693,6 +787,32 @@ class Simulation:
                 return
         mind.travel_goal = None
         self._schedule(staff, min(self.now + REASSESS, self.horizon))
+
+    def _maintenance_choice(self, staff: str, mind: Mind, location: str) -> tuple[str, int, Request] | None:
+        memory = self._environmental.get(staff)
+        if memory is None or mind.profile is None:
+            return None
+        ecology = self._world.ecology
+        assert ecology is not None
+        yard = ecology.config.refuse
+        if memory.visit is not None and self.now >= memory.visit.expires:
+            memory.visit = None
+        if "repair" not in mind.profile.capabilities:
+            return None
+        score = 37 + mind.preferences["work"]
+        if yard in mind.profile.responsibilities:
+            score += 12
+        if memory.progress is not None:
+            score += 8
+        if score <= 15:
+            return None
+        if location == yard and memory.checked is not None and memory.checked.checked_at == self.now:
+            if memory.checked.condition == "tipped container":
+                return yard, score, Request("right_bin")
+            return None
+        if memory.visit is not None:
+            return yard, score, Request("inspect")
+        return None
 
     def _sensory_proposal(self, staff: str, peer: str) -> Exchange | None:
         social = self._social[staff]

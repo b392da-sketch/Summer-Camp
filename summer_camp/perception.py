@@ -193,7 +193,7 @@ class PerceptionMind:
 
     def remember(self, cues: tuple[Evidence, ...]) -> None:
         for cue in cues:
-            if cue.modality == "inspection":
+            if cue.modality in ("inspection", "notice"):
                 guess = "current local condition"
             elif cue.modality == "vision":
                 guess = "something moved"
@@ -207,7 +207,7 @@ class PerceptionMind:
                 return
             self.clear_pending()
         for index, cue in enumerate(cues):
-            if cue.area is not None and cue.modality != "inspection":
+            if cue.area is not None and cue.modality in ("vision", "sound"):
                 self.pending = cue
                 self.pending_reference = self.sequence - len(cues) + index + 1
                 break

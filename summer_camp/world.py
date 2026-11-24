@@ -5,6 +5,10 @@ from dataclasses import dataclass
 from types import MappingProxyType
 
 from .ecology import Ecology, EcologyState
+from .maintenance import (
+    HEAVY_WETNESS, RIGHTING_TIME, WET_TRAVEL_TIME, Maintenance, ObsoleteRighting,
+    Reservation, RightingProgress,
+)
 from .perception import INSPECTION_TIME, Environment, Evidence, PhysicalEvent, inspect
 
 MINUTE = 60
@@ -97,6 +101,16 @@ class Action:
     ends_at: int
 
 
+@dataclass(frozen=True)
+class RightingAction(Action):
+    reservation: Reservation
+
+
+@dataclass(frozen=True)
+class RouteAction(Action):
+    duration: int
+
+
 class World:
     def __init__(
         self, starting_locations: dict[str, str], servings: int, repair_targets: tuple[str, ...],
@@ -105,6 +119,7 @@ class World:
         sleep_durations: Mapping[str, int] | None = None,
         environment: Environment | None = None,
         ecology: Ecology | None = None,
+        maintenance: Maintenance | None = None,
     ):
         self.locations = dict(starting_locations)
         self.servings = servings
@@ -120,6 +135,9 @@ class World:
         self.fitting_positions = {item.key: False for item in environment.fittings} if environment else {}
         self.fitting_security = {item.key: not item.loose for item in environment.fittings} if environment else {}
         self.ecology = EcologyState(ecology) if ecology is not None else None
+        self.maintenance = maintenance
+        self.righting: Reservation | None = None
+        self._righting_sequence = 0
         self.activities = ACTIVITIES
         if sleep_durations is not None:
             self.activities = {
@@ -153,6 +171,18 @@ class World:
             findings += (Evidence(now, "inspection", "wet ground", location, "ground"),)
         return findings
 
+    def notice_container(self, staff: str, now: int) -> Evidence | None:
+        if self.maintenance is None:
+            return None
+        ecology = self.ecology
+        environment = self.environment
+        assert ecology is not None and environment is not None
+        node = self.perceptual_location(staff)
+        if node != ecology.config.refuse or environment.light(node, now) - self.is_focused(staff) < 2:
+            return None
+        condition = "tipped container" if ecology.tipped else "upright container"
+        return Evidence(now, "notice", condition, node, "refuse container")
+
     def perceptual_location(self, staff: str) -> str | None:
         action = self.active.get(staff)
         if action is not None and action.request.kind in ("move", "sleep"):
@@ -161,7 +191,7 @@ class World:
 
     def is_focused(self, staff: str) -> bool:
         action = self.active.get(staff)
-        return action is not None and action.request.kind in ("prepare", "social")
+        return action is not None and action.request.kind in ("prepare", "social", "right_bin")
 
     def social_peers(self, staff: str, now: int) -> tuple[str, ...]:
         if not self._social_available(staff, now):
@@ -238,7 +268,8 @@ class World:
         return self.activities[kind].capacity - occupied
 
     def start(
-        self, staff: str, request: Request, now: int, commitment: RepairCommitment | None
+        self, staff: str, request: Request, now: int, commitment: RepairCommitment | None,
+        righting_progress: RightingProgress | None = None,
     ) -> Action:
         if staff in self.active:
             raise ValueError("already occupied")
@@ -250,6 +281,15 @@ class World:
             if request.destination not in self.paths[location]:
                 raise ValueError("destination is not adjacent")
             duration = 10 * MINUTE
+            if self.maintenance is not None and self.maintenance.crosses(location, request.destination):
+                assert self.ecology is not None
+                if self.ecology.wetness[self.maintenance.exposed_node] >= HEAVY_WETNESS:
+                    duration = WET_TRAVEL_TIME
+                action = RouteAction(request, now + duration, duration)
+                self.active[staff] = action
+                return action
+        elif kind == "right_bin" and self.maintenance is not None:
+            return self._start_righting(staff, request, now, righting_progress)
         elif kind == "inspect" and self.environment is not None:
             if request.destination is not None:
                 raise ValueError("Inspection must be local")
@@ -295,8 +335,56 @@ class World:
             self.servings -= 1
         return action
 
+    def _start_righting(
+        self, staff: str, request: Request, now: int, progress: RightingProgress | None,
+    ) -> RightingAction:
+        ecology = self.ecology
+        assert ecology is not None
+        if request.destination is not None or self.locations[staff] != ecology.config.refuse:
+            raise ValueError("Righting requires the service yard")
+        if "repair" not in self.capabilities.get(staff, ()):
+            raise ValueError("Righting requires repair capability")
+        if progress is not None and (not ecology.tipped or progress.revision != ecology.container_revision):
+            raise ObsoleteRighting("Obsolete righting progress")
+        if not ecology.tipped:
+            raise ValueError("Container is upright")
+        if self.righting is not None:
+            raise ValueError("Container is reserved")
+        self._righting_sequence += 1
+        reservation = Reservation(staff, self._righting_sequence, ecology.container_revision)
+        duration = progress.remaining if progress is not None else RIGHTING_TIME
+        action = RightingAction(request, now + duration, reservation)
+        self.righting = reservation
+        self.active[staff] = action
+        return action
+
+    def suspend_righting(self, staff: str, now: int) -> RightingProgress | None:
+        action = self.active.get(staff)
+        if not isinstance(action, RightingAction) or self.righting != action.reservation or now >= action.ends_at:
+            return None
+        self.righting = None
+        del self.active[staff]
+        return RightingProgress(action.reservation.revision, action.ends_at - now)
+
+    def complete_righting(self, staff: str, action: RightingAction, now: int) -> bool:
+        ecology = self.ecology
+        assert ecology is not None
+        if (self.active.get(staff) is not action or self.righting != action.reservation
+                or action.reservation.worker != staff or now != action.ends_at):
+            return False
+        self.righting = None
+        del self.active[staff]
+        if not ecology.tipped or ecology.container_revision != action.reservation.revision:
+            return False
+        ecology.tipped = False
+        ecology.container_revision += 1
+        return True
+
     def finish(self, staff: str) -> str:
-        kind = self.active[staff].request.kind
+        action = self.active[staff]
+        if isinstance(action, RightingAction):
+            raise ValueError("Righting completion requires the original action and timestamp")
+        kind = action.request.kind
         detail = ""
         if kind == "move":
             destination = self.active[staff].request.destination
